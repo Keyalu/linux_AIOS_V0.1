@@ -1,0 +1,46 @@
+# ---------- 敏感信息（密钥/授权码/凭据）----------
+# LLM API Key、SMTP 授权码等运行时配置，严禁入库
+system_out/
+*.env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.p8
+*.jks
+*.keystore
+credentials.json
+client_secret*.json
+config.local.json
+
+# ---------- 运行产物 / 备份 ----------
+out/
+*.zip
+*.tar
+*.gz
+*.log
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# ---------- 测试临时目录 ----------
+tests/.tmp_out_*/
+
+# ---------- 编辑器 / 系统 ----------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

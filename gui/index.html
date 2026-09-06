@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent_OS_v1.0 · 系统控制台</title>
+<style>
+:root{--ink:#0f172a;--sub:#64748b;--line:#e2e8f0;--bg:#f8fafc;--blue:#2563eb;--blue-bg:#dbeafe;
+--green:#16a34a;--green-bg:#dcfce7;--red:#dc2626;--red-bg:#fee2e2;--amber:#d97706;--amber-bg:#fef3c7}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:var(--bg);color:var(--ink)}
+header{background:#fff;border-bottom:1px solid var(--line);padding:14px 28px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+header h1{font-size:18px}
+header .warn{font-size:12px;color:var(--amber);background:var(--amber-bg);padding:4px 12px;border-radius:99px}
+nav{display:flex;gap:6px;margin-left:auto}
+nav button{border:1px solid var(--line);background:#fff;padding:7px 18px;border-radius:9px;font-size:13.5px;cursor:pointer;color:var(--sub)}
+nav button.on{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+main{max-width:1180px;margin:24px auto;padding:0 24px}
+.page{display:none}.page.on{display:block}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:18px}
+.card h2{font-size:15px;margin-bottom:4px}
+.card .desc{font-size:12.5px;color:var(--sub);margin-bottom:16px}
+.go{background:var(--blue);border:0;color:#fff;font-size:14px;font-weight:600;padding:10px 26px;border-radius:9px;cursor:pointer}
+.go:hover{background:#1d4ed8}
+.go:disabled{opacity:.55;cursor:default}
+.ghost{background:#fff;border:1px solid var(--line);color:var(--sub);padding:8px 16px;border-radius:9px;cursor:pointer;font-size:12.5px}
+.ghost:hover{color:var(--red);border-color:var(--red)}
+.result{margin-top:14px;border-radius:10px;padding:14px 16px;font-family:Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-all;display:none}
+.result.ok{background:var(--green-bg);border:1px solid var(--green)}
+.result.bad{background:var(--red-bg);border:1px solid var(--red)}
+.result.plain{background:#fbfdff;border:1px solid var(--line);max-height:430px;overflow:auto;display:block}
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:14px 0}
+.kpi{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.kpi .v{font-size:24px;font-weight:700}.kpi .l{font-size:11.5px;color:var(--sub);margin-top:3px}
+.ok{color:var(--green)}.bad{color:var(--red)}.bl{color:var(--blue)}
+table{width:100%;border-collapse:collapse;font-size:12.5px;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:#fbfdff;font-size:12px;color:var(--sub)}
+tr:last-child td{border-bottom:0}
+.empty{text-align:center;color:var(--sub);padding:14px}
+.chip{font-size:10.5px;padding:2px 8px;border-radius:99px;font-weight:700}
+.chip.ok{background:var(--green-bg);color:var(--green)}.chip.bad{background:var(--red-bg);color:var(--red)}
+.chip.esc{background:var(--amber-bg);color:var(--amber)}.chip.src{background:var(--blue-bg);color:var(--blue)}
+.flow{display:flex;align-items:center;gap:8px;margin:14px 0 4px;flex-wrap:wrap}
+.fbox{border:1.5px solid var(--line);border-radius:10px;padding:9px 14px;text-align:center;min-width:104px;background:#fff}
+.fbox b{display:block;font-size:13px}.fbox span{font-size:11px;color:var(--sub)}
+.fbox.real{border-style:dashed}
+.fbox.lit{border-color:var(--blue);background:var(--blue-bg)}
+.fbox.lit b{color:var(--blue)}
+.farrow{color:var(--sub);font-size:16px}
+.farrow.lit{color:var(--blue);font-weight:700}
+.verdict{margin-left:auto;font-size:15px;font-weight:700}
+.verdict.pass{color:var(--green)}.verdict.fail{color:var(--red)}
+.lvl{display:flex;gap:8px;margin:14px 0}
+.lvl button{flex:1;border:1.5px solid var(--line);background:#fff;padding:8px;border-radius:9px;cursor:pointer;font-size:13px;color:var(--sub)}
+.lvl button.on{border-color:var(--blue);background:var(--blue-bg);color:var(--blue);font-weight:700}
+.meta-line{font-size:12px;color:var(--sub);margin:8px 0;display:none}
+input,textarea,select{border:1px solid var(--line);border-radius:8px;padding:8px 11px;font-size:13px;font-family:inherit}
+input:focus,textarea:focus{outline:2px solid var(--blue-bg);border-color:var(--blue)}
+code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
+.hit{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0;background:#fbfdff}
+.grid2{display:grid;grid-template-columns:340px 1fr;gap:20px;align-items:start}
+.search{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:13px;margin-bottom:10px}
+.search:focus{outline:2px solid var(--blue-bg);border-color:var(--blue)}
+.filters{display:flex;gap:6px;margin-bottom:10px}
+.filters button{flex:1;border:1px solid var(--line);background:#fff;padding:6px;border-radius:99px;font-size:12px;cursor:pointer;color:var(--sub)}
+.filters button.on{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+.group-h{font-size:11.5px;color:var(--sub);padding:10px 14px 4px;background:#fbfdff;letter-spacing:.5px}
+.list .item{padding:10px 14px}
+.list .item .tname{font-size:13.5px;font-weight:600;font-family:Consolas,monospace}
+.tag{font-size:10px;padding:2px 8px;border-radius:99px;font-weight:700;flex-shrink:0}
+.t-tool{background:var(--blue-bg);color:var(--blue)}
+.t-skill{background:var(--green-bg);color:var(--green)}
+.t-mcp{background:#f3e8ff;color:#9333ea}
+.form-head{display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap}
+.form-head h2{margin:0}
+.badge-adm{background:var(--amber-bg);color:var(--amber)}
+.badge-use{background:var(--blue-bg);color:var(--blue)}
+.badge-pub{background:#f1f5f9;color:var(--sub)}
+.hit b{font-size:13px}.hit .m{font-size:12px;color:var(--sub);margin:4px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent_OS_v1.0 · 系统控制台</h1>
+  <span class="warn">⚠ 编排会执行真实 OS 操作 —— 演示请用沙箱目录</span>
+  <nav>
+    <button data-p="orch" class="on">编排控制台</button>
+    <button data-p="tools">工具台</button>
+    <button data-p="stats">系统统计</button>
+    <button data-p="rag">RAG 知识库</button>
+    <button data-p="llm">LLM 设置</button>
+    <button data-p="settings">系统设置</button>
+  </nav>
+</header>
+<main>
+
+<!-- ============ 编排控制台 ============ -->
+<section class="page on" id="page-orch">
+  <div class="card">
+    <h2>五组集成编排<span style="font-weight:400;font-size:12px;color:var(--sub)">　用户 → 组1 → 组5安全 → 组2 → 组3 → 组4 ←→ 组5审计/RAG</span></h2>
+    <div style="display:flex;gap:10px;margin:12px 0 4px">
+      <input id="orch-text" style="flex:1" value="帮我把「demo_task」文件夹里的文件整理一下，顺便看看有没有重复文件，最后备个份"
+        placeholder="输入自然语言指令，如：查询长沙天气 / 打开文件管理器 / rm -rf /（会被拦截）">
+      <button class="go" id="orch-run" onclick="orchestrate()">▶ 运行编排</button>
+    </div>
+    <div class="flow">
+      <div class="fbox" id="fb1"><b>组1</b><span>HostAgent<br>意图理解</span></div>
+      <div class="farrow">→</div>
+      <div class="fbox" id="fb2"><b>组5</b><span>SecuritySandbox<br>安全检查</span></div>
+      <div class="farrow">→</div>
+      <div class="fbox" id="fb3"><b>组2</b><span>TaskPlanner<br>规划+控件</span></div>
+      <div class="farrow">→</div>
+      <div class="fbox" id="fb4"><b>组3</b><span>AppAgent<br>执行</span></div>
+      <div class="farrow">→</div>
+      <div class="fbox real" id="fb5"><b>组4</b><span>Tools 真实模块<br>闸门放行+统计</span></div>
+      <div class="farrow">→</div>
+      <div class="fbox" id="fb6"><b>组5</b><span>审计+RAG</span></div>
+      <div class="verdict" id="orch-verdict"></div>
+    </div>
+    <div id="orch-kpis" class="kpis"></div>
+    <div id="orch-confirm" style="display:none;border:1.5px solid var(--amber);background:var(--amber-bg);border-radius:10px;padding:14px 16px;margin-top:12px">
+      <b style="color:var(--amber)">⚠ 需要你的确认</b>
+      <div id="orch-confirm-detail" style="margin:8px 0;font-size:12.5px"></div>
+      <div style="display:flex;gap:10px">
+        <button class="go" onclick="confirmExecute('full')">✓ 全部允许并执行</button>
+        <button class="ghost" onclick="confirmExecute('safe')">仅执行免提权步骤</button>
+        <button class="ghost" onclick="confirmExecute('cancel')">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:18px">
+    <h2>组3 执行明细<span style="font-weight:400;font-size:12px;color:var(--sub)">　实时事件流</span></h2>
+    <table style="margin-top:10px"><thead><tr><th>步</th><th>接口</th><th>身份</th><th>耗时</th><th>结果</th></tr></thead>
+    <tbody id="orch-steps"><tr><td colspan="5" class="empty">点击「运行编排」开始</td></tr></tbody></table>
+    <div id="orch-events" style="margin-top:10px;font-size:12.5px"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:18px">
+    <h2>AT-SPI 控件树<span style="font-weight:400;font-size:12px;color:var(--sub)">　agent 通过辅助功能接口"看见"的桌面元素</span>
+      <button class="ghost" style="margin-left:12px" onclick="loadControls()">刷新控件树</button>
+      <span id="ctl-meta" style="font-size:12px;color:var(--sub);margin-left:10px"></span></h2>
+    <div id="ctl-tree" style="max-height:300px;overflow:auto;font-family:Consolas,monospace;font-size:12px;background:#fbfdff;border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:10px">点击「刷新控件树」读取真实桌面</div>
+  </div>
+
+  <div class="card">
+    <h2>中间产物（组间只传 JSON）</h2>
+    <div class="lvl" style="margin:10px 0" id="orch-tabs">
+      <button data-a="intent" class="on">intent</button>
+      <button data-a="check">check</button>
+      <button data-a="plan">plan</button>
+      <button data-a="session">session_log</button>
+      <button data-a="audit">audit</button>
+      <button data-a="stats">stats</button>
+    </div>
+    <div class="result plain" id="orch-json">—</div>
+  </div>
+</section>
+
+<!-- ============ 工具台 ============ -->
+<section class="page" id="page-tools">
+  <div class="grid2">
+    <div>
+      <input class="search" id="tool-search" placeholder="搜索工具 / 技能名称…">
+      <div class="filters" id="tool-filter">
+        <button data-f="all" class="on">全部</button>
+        <button data-f="tool">工具</button>
+        <button data-f="skill">技能</button>
+        <button data-f="mcp">MCP</button>
+      </div>
+      <div class="list" id="tool-list" style="max-height:560px;overflow:auto"></div>
+    </div>
+    <div class="card" id="tool-form"><div class="desc">← 从左侧选择一个工具/技能，表单按 schema 自动生成</div></div>
+  </div>
+</section>
+
+<!-- ============ 系统统计 ============ -->
+<section class="page" id="page-stats">
+  <div class="card">
+    <div class="toolbar" style="display:flex;gap:10px;align-items:center">
+      <label style="font-size:12.5px;color:var(--sub)"><input type="checkbox" id="auto" checked> 每 2 秒自动刷新</label>
+      <button class="ghost" onclick="refreshStats()">手动刷新</button>
+      <button class="ghost" onclick="clearStats()">🗑 清空系统账本</button>
+      <span id="stats-updated" style="font-size:12px;color:var(--sub)"></span>
+    </div>
+    <div class="kpis" id="stats-kpis"></div>
+    <div class="card" style="margin-bottom:16px;padding:14px 18px"><h2>按接口聚合</h2><div id="stats-bars" style="margin-top:10px"></div></div>
+    <table><thead><tr><th>时间</th><th>接口</th><th>结果</th><th>耗时</th><th>参数 / 错误</th></tr></thead>
+    <tbody id="stats-rows"><tr><td colspan="5" class="empty">暂无调用记录</td></tr></tbody></table>
+  </div>
+</section>
+
+<!-- ============ LLM 设置 ============ -->
+<section class="page" id="page-llm">
+  <div class="card">
+    <h2>LLM 供应商配置<span style="font-weight:400;font-size:12px;color:var(--sub)">　仅组1 意图理解调用 LLM（发送：系统提示词+你的原话，返回 intent JSON）；组2~5 全部本地执行</span></h2>
+    <div class="field"><label>供应商预设</label>
+      <select id="llm-provider" style="width:100%">
+        <option value="glm">智谱 GLM（open.bigmodel.cn）</option>
+        <option value="deepseek">DeepSeek（api.deepseek.com）</option>
+        <option value="dashscope">通义千问（dashscope.aliyuncs.com）</option>
+        <option value="custom">自定义（任意 OpenAI 兼容接口）</option>
+      </select></div>
+    <div class="field"><label>Base URL<span class="tip">OpenAI 兼容接口地址</span></label>
+      <input id="llm-base" placeholder="https://..."></div>
+    <div class="field"><label>模型名<span class="tip">如 glm-5.3-flash / deepseek-v4-flash / qwen-plus</span></label>
+      <input id="llm-model" placeholder="模型名"></div>
+    <div class="field"><label>API Key<span class="tip" id="llm-key-tip">首次必填；已配置时留空表示沿用旧 Key</span></label>
+      <input id="llm-key" type="password" placeholder=""></div>
+    <div style="display:flex;gap:10px;margin-top:6px">
+      <button class="go" onclick="saveLLM()">保存并启用</button>
+      <button class="ghost" onclick="testLLM()">测试连接</button>
+      <span id="llm-status" style="font-size:12.5px;color:var(--sub);align-self:center"></span>
+    </div>
+    <div class="result plain" id="llm-test" style="margin-top:14px;display:none"></div>
+  </div>
+  <div class="card">
+    <h2>邮件服务（SMTP）<span style="font-weight:400;font-size:12px;color:var(--sub)">　持久保存，重启后 send_email 默认可用</span></h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 16px">
+      <div class="field"><label>SMTP 服务器<span class="tip">如 smtp.qq.com</span></label><input id="smtp-host"></div>
+      <div class="field"><label>端口<span class="tip">465=SSL / 587=STARTTLS</span></label><input id="smtp-port" value="465"></div>
+      <div class="field"><label>账号（发件邮箱）</label><input id="smtp-user"></div>
+      <div class="field"><label>授权码<span class="tip" id="smtp-pass-tip"></span></label><input id="smtp-pass" type="password"></div>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="go" onclick="saveSMTP()">保存并启用</button>
+      <button class="ghost" onclick="testSMTP()">发送测试邮件（发给自己）</button>
+      <span id="smtp-status" style="font-size:12.5px;color:var(--sub)"></span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>当前状态</h2>
+    <div id="llm-now" style="font-size:12.5px;color:var(--sub)">加载中…</div>
+  </div>
+</section>
+
+<!-- ============ 系统设置 ============ -->
+<section class="page" id="page-settings">
+  <div class="card">
+    <h2>编排行为<span style="font-weight:400;font-size:12px;color:var(--sub)">　这些旋钮即时生效、持久保存，不会影响系统骨架</span></h2>
+    <div class="field"><label>组1 意图引擎</label>
+      <select id="set-engine" style="width:100%">
+        <option value="llm">LLM（需已在 LLM 设置配置 Key）</option>
+        <option value="rules">仅规则 Mock（离线/省 Key）</option>
+      </select></div>
+    <div class="field"><label>LLM 温度<span class="tip">0=稳定输出 1=更发散，仅 LLM 引擎生效</span></label>
+      <input id="set-temp" type="number" min="0" max="1" step="0.1"></div>
+    <div class="field"><label>组3 默认执行身份<span class="tip">低于步骤要求时会走提权确认流</span></label>
+      <select id="set-level" style="width:100%">
+        <option value="public">public</option>
+        <option value="user">user（推荐）</option>
+        <option value="admin">admin（慎用：跳过提权流）</option>
+      </select></div>
+    <div class="field"><label>提权确认策略</label>
+      <select id="set-confirm" style="width:100%">
+        <option value="auto">自动同意（演示模式）</option>
+        <option value="deny">自动拒绝（观察提权被拦的合规表现）</option>
+      </select></div>
+    <div class="field"><label>组3 GUI 动作间隔（秒）</label>
+      <input id="set-delay" type="number" min="0" max="5" step="0.1"></div>
+    <div class="field"><label style="display:flex;gap:8px;align-items:center">
+      <input type="checkbox" id="set-finale" style="width:auto">规划末尾附加提权演示收尾步（echo [plan done]）</label></div>
+  </div>
+  <div class="card">
+    <h2>安全与 RAG</h2>
+    <div class="field"><label>追加受保护路径<span class="tip">逗号分隔，如 /home/keyal/secret, /mnt/backup；与内置清单叠加，只增不减</span></label>
+      <textarea id="set-protected" rows="2" style="width:100%"></textarea></div>
+    <div class="field"><label>RAG 默认返回条数（1~20）</label>
+      <input id="set-ragk" type="number" min="1" max="20" step="1"></div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="go" onclick="saveSettings()">保存并即时生效</button>
+      <button class="ghost" onclick="resetSettings()">恢复默认</button>
+      <span id="set-status" style="font-size:12.5px;color:var(--sub)"></span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ RAG 知识库 ============ -->
+<section class="page" id="page-rag">
+  <div class="card">
+    <h2>RAG 执行轨迹知识库<span style="font-weight:400;font-size:12px;color:var(--sub)">　TF 余弦检索 · JSONL 落盘（system_out/rag_traces.jsonl）</span></h2>
+    <div style="display:flex;gap:10px;margin:12px 0">
+      <input id="rag-q" style="flex:1" placeholder="输入查询，如：整理 / 天气 / 备份（留空 = 最近轨迹）">
+      <button class="go" onclick="ragQuery()">检索</button>
+    </div>
+    <div id="rag-total" style="font-size:12.5px;color:var(--sub);margin-bottom:8px"></div>
+    <div id="rag-hits"></div>
+  </div>
+</section>
+</main>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const pretty=o=>JSON.stringify(o,null,2);
+
+/* 导航 */
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("nav button").forEach(x=>x.classList.remove("on"));
+  document.querySelectorAll(".page").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");$("#page-"+b.dataset.p).classList.add("on");
+  if(b.dataset.p==="stats")refreshStats();
+  if(b.dataset.p==="rag")ragQuery();
+  if(b.dataset.p==="llm"){loadLLM();loadSMTP()}
+  if(b.dataset.p==="settings")loadSettings();
+});
+
+/* ---------- 编排控制台 ---------- */
+const FLOW=["fb1","fb2","fb3","fb4","fb5","fb6"];
+let BUNDLE=null;
+async function post(url,body){const r=await fetch(url,{method:"POST",
+  headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});return r.json()}
+
+let CURSOR=0,RUN_ID=null,POLL=null,LAST_ENGINE="rules";
+function _flowTo(n){/* 点亮前 n 个盒子 */}
+async function orchestrate(){
+  const btn=$("#orch-run");btn.disabled=true;btn.textContent="组1 意图理解中（LLM，最长约 1 分钟）…";
+  $("#orch-confirm").style.display="none";
+  const v=$("#orch-verdict");v.className="verdict";v.textContent="";
+  FLOW.forEach(id=>document.getElementById(id).classList.remove("lit"));
+  document.querySelectorAll(".farrow").forEach(a=>a.classList.remove("lit"));
+  $("#orch-steps").innerHTML='<tr><td colspan="5" class="empty">组1 意图理解中（LLM，复杂指令最长约 1 分钟）…</td></tr>';
+  let staged;
+  try{staged=await post("/api/plan",{user_text:$("#orch-text").value});}
+  catch(e){staged={ok:false,rejected:String(e)};}
+  btn.disabled=false;btn.textContent="▶ 运行编排";
+  if(staged.ok===false){
+    $("#orch-steps").innerHTML=`<tr><td class="empty bad">${esc(staged.rejected||staged.error||"失败")}</td></tr>`;
+    v.className="verdict fail";v.textContent="被拦截";return;
+  }
+  if(staged.pending){
+    // 需要用户确认：列出提权步骤与真实外发
+    CURSOR=0;RUN_ID=null;BUNDLE=null;
+    $("#orch-tabs").querySelectorAll("button").forEach(b=>b.classList.remove("on"));
+    showStaged(staged);
+    PIPE_TOKEN=staged.token;
+    $("#orch-confirm").style.display="block";
+    $("#orch-confirm-detail").innerHTML=
+      `<div>本计划包含<b>高影响动作</b>，需要你批准：</div>`+
+      staged.admin_steps.map(s=>`<div>🔑 步骤${s.step} <code>${esc(s.action)}</code> 需要提权 ADMIN</div>`).join("")+
+      staged.real_send_steps.map(s=>`<div>📧 步骤${s.step} <code>send_email</code> 将<b>真实发送</b>：to=${esc(s.params.to||"")} 主题=${esc(s.params.subject||"")}${s.params.attachment?` 附件=${esc(s.params.attachment)}`:""}</div>`).join("");
+    return;
+  }
+  startPolling(staged.run_id);
+}
+function showStaged(staged){
+  BUNDLE=staged;showPipeJson("plan");
+  const it=staged.intent,c=staged.check;
+  $("#orch-kpis").innerHTML=
+    `<div class="kpi"><div class="v ${c.approved?"ok":"bad"}">${c.approved?"通过":"拦截"}</div><div class="l">安全(${c.risk_level})</div></div>
+     <div class="kpi"><div class="v bl">${staged.plan.steps.length}</div><div class="l">规划步骤</div></div>
+     <div class="kpi"><div class="v" style="font-size:14px;padding-top:8px">${esc(it.action||"-")}</div><div class="l">意图动作</div></div>`;
+}
+async function confirmExecute(mode){
+  if(mode==="cancel"){$("#orch-confirm").style.display="none";$("#orch-steps").innerHTML='<tr><td colspan="5" class="empty">已取消</td></tr>';return}
+  $("#orch-confirm").style.display="none";
+  const r=await post("/api/execute",{token:PIPE_TOKEN,mode});
+  if(r.run_id)startPolling(r.run_id);
+}
+let PIPE_TOKEN=null;
+async function startPolling(run_id){
+  RUN_ID=run_id;CURSOR=0;
+  $("#orch-steps").innerHTML='<tr><td colspan="5" class="empty">执行中…</td></tr>';
+  $("#orch-events").innerHTML="";
+  clearInterval(POLL);
+  POLL=setInterval(pollRun,800);
+  pollRun();
+}
+async function pollRun(){
+  if(!RUN_ID)return;
+  let d;
+  try{d=await fetch(`/api/run?id=${RUN_ID}&cursor=${CURSOR}`).then(r=>r.json())}
+  catch(e){return}   // 瞬时网络抖动：下一轮再取
+  CURSOR=d.cursor;
+  d.events.forEach(e=>{
+    FLOW.forEach(id=>document.getElementById(id).classList.add("lit"));
+    if(e.stage==="intent"){litFlow(1);LAST_ENGINE=e.engine||"rules"}
+    if(e.stage==="security")litFlow(2);
+    if(e.stage==="plan")litFlow(3);
+    if(e.stage==="step"){
+      litFlow(4);
+      const r=e.step.tool_result,escSteps=new Set((BUNDLE?.session?.escalations||[]).map(x=>x.step));
+      const row=`<tr><td>${e.step.step}</td><td><b>${esc(e.step.name)}</b><br><span style="color:var(--sub);font-size:11px">${e.step.kind}</span></td>
+        <td>${esc(e.step.level_used)}</td><td>${e.step.duration_ms} ms</td>
+        <td><span class="chip ${r.success?"ok":"bad"}">${r.success?"成功":"失败"}</span>
+        ${r.success?"":`<br><span class="bad" style="font-size:11px">${esc(r.error||"")}</span>`}</td></tr>`;
+      const tb=$("#orch-steps");
+      if(tb.querySelector(".empty"))tb.innerHTML="";
+      tb.insertAdjacentHTML("beforeend",row);
+    }
+    if(e.stage==="done")litFlow(6);
+    if(e.stage==="rejected")litFlow(2);
+  });
+  if(d.status==="done"||d.status==="rejected"||d.status==="failed"){
+    clearInterval(POLL);POLL=null;RUN_ID=null;
+    BUNDLE=d.bundle||{ok:false,error:d.error||d.rejected};
+    if(BUNDLE&&BUNDLE.session){renderBundle()}
+    else if(d.status==="failed"){$("#orch-steps").innerHTML=`<tr><td class="empty bad">${esc(d.error||"执行失败")}</td></tr>`}
+  }
+}
+function litFlow(n){
+  FLOW.forEach((id,i)=>{const el=document.getElementById(id);
+    if(i<n)el.classList.add("lit");else el.classList.remove("lit")});
+}
+function renderBundle(){
+  const a=BUNDLE.audit||{};
+  const v=$("#orch-verdict");v.className="verdict "+(a.verdict==="PASS"?"pass":"fail");
+  v.textContent=a.verdict==="PASS"?"审计 PASS ✔":"审计 FAIL ✘";
+  const s=BUNDLE.session?BUNDLE.session.summary:(BUNDLE.stats_detail?{}:{});
+  const st=BUNDLE.stats_detail||{};
+  $("#orch-kpis").innerHTML=
+    `<div class="kpi"><div class="v bl">${st.summary?.total??s.total??0}</div><div class="l">组4 落账调用</div></div>
+     <div class="kpi"><div class="v ok">${st.summary?.ok??s.success??0}</div><div class="l">成功</div></div>
+     <div class="kpi"><div class="v ${(st.summary?.fail??s.fail)?"bad":""}">${st.summary?.fail??s.fail??0}</div><div class="l">失败</div></div>
+     <div class="kpi"><div class="v">${st.summary?.rate??0}%</div><div class="l">成功率</div></div>
+     <div class="kpi"><div class="v ok">${BUNDLE.session?BUNDLE.session.summary.success+"/"+BUNDLE.session.summary.total:"-"}</div><div class="l">组3 步骤成功</div></div>`;
+  const escSteps=new Set((BUNDLE.session?.escalations||[]).map(x=>x.step));
+  $("#orch-steps").innerHTML=BUNDLE.session.steps.map(st=>{
+    const r=st.tool_result;
+    return `<tr class="${escSteps.has(st.step)?"hl":""}"><td>${st.step}</td>
+      <td><b>${esc(st.name)}</b><br><span style="color:var(--sub);font-size:11px">${st.kind}</span></td>
+      <td>${esc(st.level_used)}${escSteps.has(st.step)?' <span class="chip esc">提权</span>':""}</td>
+      <td>${st.duration_ms} ms</td>
+      <td><span class="chip ${r.success?"ok":"bad"}">${r.success?"成功":"失败"}</span>
+      ${r.success?`<br><span style="color:var(--sub);font-size:11px">${esc(String(r.result).slice(0,60))}</span>`
+                 :`<br><span class="bad" style="font-size:11px">${esc(r.error||"")}</span>`}</td></tr>`}).join("");
+  let ev=`<div>🧠 意图引擎：<b>${esc(LAST_ENGINE||"rules")}</b>（仅组1 意图理解调用 LLM，其余组全部本地执行）</div>`;
+  (BUNDLE.session.escalations||[]).forEach(e=>ev+=`<div>🔑 <span class="chip esc">提权流</span> 步骤${e.step} ${esc(e.tool)}：${esc(e.from)} 被拒 → 已确认 → ADMIN 重试</div>`);
+  (BUNDLE.session.self_healed||[]).forEach(h=>ev+=`<div>🩹 自愈 ${esc(h.wrong)} → <b>${esc(h.fixed)}</b></div>`);
+  $("#orch-events").innerHTML=ev||'';
+  showPipeJson("audit");
+}
+function showPipeJson(which){
+  document.querySelectorAll("#orch-tabs button").forEach(b=>b.classList.toggle("on",b.dataset.a===which));
+  const box=$("#orch-json");if(!BUNDLE){box.textContent="—";return}
+  const map={intent:BUNDLE.intent,check:BUNDLE.check,plan:BUNDLE.plan,
+             session:BUNDLE.session,audit:BUNDLE.audit,stats:BUNDLE.stats_detail||{}};
+  box.textContent=pretty(map[which]||{});
+}
+function showPipeJson(which){
+  document.querySelectorAll("#orch-tabs button").forEach(b=>b.classList.toggle("on",b.dataset.a===which));
+  const box=$("#orch-json");if(!BUNDLE){box.textContent="—";return}
+  const map={intent:BUNDLE.intent,check:BUNDLE.check,plan:BUNDLE.plan,
+             session:BUNDLE.session,audit:BUNDLE.audit,stats:BUNDLE.stats_detail||{}};
+  box.textContent=pretty(map[which]||{});
+}
+document.querySelectorAll("#orch-tabs button").forEach(b=>b.onclick=()=>showPipeJson(b.dataset.a));
+
+/* ---------- 工具台 ---------- */
+const SKILL_SET=new Set(["organize_downloads","find_duplicate_files","backup_directory",
+  "find_large_files","disk_usage","system_check","cleanup_temp","find_files"]);
+const badgeCls=p=>p==="admin"?"badge-adm":p==="public"?"badge-pub":"badge-use";
+let TOOLS=[],cur=null,curFilter="all",curSearch="";
+
+function categoryOf(t){
+  if(t.name.startsWith("mcp_"))return"mcp";
+  return SKILL_SET.has(t.name)?"skill":"tool";
+}
+async function initTools(){
+  const d=await fetch("/api/tools").then(r=>r.json());
+  TOOLS=d.tools||[];
+  renderList();
+}
+function renderList(){
+  const el=$("#tool-list");el.innerHTML="";
+  const kw=curSearch.toLowerCase();
+  const shown=TOOLS.filter(t=>
+    (curFilter==="all"||categoryOf(t)===curFilter)&&
+    (!kw||t.name.toLowerCase().includes(kw)));
+  if(!shown.length){el.innerHTML='<div class="empty">没有匹配的能力</div>';return}
+  const groups={tool:[],skill:[],mcp:[]};
+  shown.forEach(t=>groups[categoryOf(t)].push(t));
+  const labels={tool:"工具",skill:"技能",mcp:"MCP"};
+  for(const g of["tool","skill","mcp"]){
+    if(!groups[g].length)continue;
+    const h=document.createElement("div");h.className="group-h";
+    h.textContent=`${labels[g]} · ${groups[g].length}`;
+    el.appendChild(h);
+    groups[g].forEach(t=>{
+      const d=document.createElement("div");d.className="item";
+      d.innerHTML=`<span class="tname">${esc(t.name)}</span>
+        <span style="display:flex;gap:5px">
+          <span class="tag t-${g}">${labels[g]}</span>
+          <span class="tag ${badgeCls(t.permission||"user")}">${esc(t.permission||"user")}</span>
+        </span>`;
+      d.onclick=()=>{el.querySelectorAll(".item").forEach(x=>x.classList.remove("on"));
+        d.classList.add("on");renderForm(t)};
+      el.appendChild(d);
+    });
+  }
+}
+function renderForm(t){
+  cur=t;const box=$("#tool-form");
+  const g=categoryOf(t),labels={tool:"工具",skill:"技能",mcp:"MCP 工具"};
+  const props=t.inputSchema.properties,req=t.inputSchema.required||[];
+  let html=`<div class="form-head"><h2 style="font-family:Consolas,monospace">${esc(t.name)}</h2>
+    <span class="tag t-${g}">${labels[g]}</span>
+    <span class="tag ${badgeCls(t.permission||"user")}">${esc(t.permission||"user")}</span></div>
+    <div class="desc">${esc(t.description||"")}</div>`;
+  if(!Object.keys(props).length)
+    html+='<div class="desc">此能力无需参数，直接执行。</div>';
+  for(const[k,p]of Object.entries(props)){
+    const def=p.default!==undefined&&p.default!==null?`value="${esc(String(p.default))}"`:"";
+    html+=`<div class="field"><label>${esc(k)}${req.includes(k)?'<span class="req"> *</span>':""}
+      <span class="tip">${esc(p.description||"")}${p.type==="number"?"（数字）":""}</span></label>
+      <input id="f-${esc(k)}" data-k="${esc(k)}" data-t="${p.type}" ${def}></div>`;
+  }
+  html+=`<div class="field"><label>以什么身份调用（user_level）</label><div class="lvl" id="lvl">`;
+  for(const l of["public","user","admin"])
+    html+=`<button data-l="${l}" class="${l===(t.permission||"user")?"on":""}">${l}</button>`;
+  html+=`</div></div><button class="go" onclick="callTool()">执行 ${esc(t.name)}</button>
+    <div class="result" id="tool-res"></div>`;
+  box.innerHTML=html;
+  document.querySelectorAll("#lvl button").forEach(b=>b.onclick=()=>{
+    document.querySelectorAll("#lvl button").forEach(x=>x.classList.remove("on"));b.classList.add("on")});
+}
+async function callTool(){
+  const level=document.querySelector("#lvl button.on")?.dataset.l||"user";
+  const params={};document.querySelectorAll("#tool-form [data-k]").forEach(el=>{
+    let v=el.value.trim();if(v==="")return;
+    if((v.startsWith('"')&&v.endsWith('"'))||(v.startsWith("'")&&v.endsWith("'")))v=v.slice(1,-1).trim();
+    if(v==="")return;if(el.dataset.t==="number"){const n=Number(v);if(!Number.isNaN(n))v=n}
+    if(el.dataset.t==="boolean")v=!(v.toLowerCase()in{"false":1,"0":1,"no":1,"off":1});
+    params[el.dataset.k]=v});
+  const box=$("#tool-res");box.style.display="block";box.className="result plain";box.textContent="执行中…";
+  const data=await post(categoryOf(cur)==="skill"?"/api/skill":"/api/call",
+                        {name:cur.name,params,level});
+  const ok=data.result&&data.result.success;
+  box.className="result "+(ok?"ok":"bad");box.textContent=pretty(data.result);
+}
+$("#tool-search").oninput=e=>{curSearch=e.target.value.trim();renderList()};
+document.querySelectorAll("#tool-filter button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#tool-filter button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");curFilter=b.dataset.f;renderList()});
+
+/* ---------- 系统统计 ---------- */
+let timer=null;
+async function refreshStats(){
+  const d=await fetch("/api/stats").then(r=>r.json());
+  const s=d.summary||{};
+  $("#stats-kpis").innerHTML=
+    `<div class="kpi"><div class="v bl">${s.total||0}</div><div class="l">总调用</div></div>
+     <div class="kpi"><div class="v ok">${s.ok||0}</div><div class="l">成功</div></div>
+     <div class="kpi"><div class="v ${s.fail?"bad":""}">${s.fail||0}</div><div class="l">失败</div></div>
+     <div class="kpi"><div class="v">${s.rate??0}%</div><div class="l">成功率</div></div>
+     <div class="kpi"><div class="v" style="font-size:14px;padding-top:8px">${d.updated?d.updated.replace("T"," ").slice(0,19):"-"}</div><div class="l">最近落盘</div></div>`;
+  $("#stats-updated").textContent="账本：system_out/stats.json（编排的组4 层调用逐笔落账；技能步骤按契约不留痕）";
+  const cs=Object.entries(d.counters||{}).sort((a,b)=>b[1].calls-a[1].calls);
+  const mx=Math.max(1,...cs.map(c=>c[1].calls));
+  $("#stats-bars").innerHTML=cs.map(([k,c])=>`<div class="bar-row"><span>${esc(k)}</span>
+    <div class="bar-track"><div class="bar-fill" style="width:${(100*c.calls/mx).toFixed(1)}%"></div></div>
+    <span style="color:var(--sub);text-align:right">${c.calls} 次 · 败 ${c.fail}</span></div>`).join("")
+    ||'<div class="empty">尚无数据</div>';
+  const recs=(d.records||[]).slice().reverse();
+  $("#stats-rows").innerHTML=recs.length?recs.map(r=>`<tr>
+    <td><code>${(r.time||"").replace("T"," ").slice(0,19)}</code></td>
+    <td><b>${esc(r.tool)}</b></td>
+    <td><span class="chip ${r.success?"ok":"bad"}">${r.success?"成功":"失败"}</span></td>
+    <td>${r.duration_ms} ms</td>
+    <td>${r.success?`<code>${esc(JSON.stringify(r.params))}</code>`:`<span class="bad">${esc(r.error||"")}</span>`}</td>
+  </tr>`).join(""):'<tr><td colspan="5" class="empty">暂无调用记录</td></tr>';
+}
+$("#auto").onchange=e=>{clearInterval(timer);if(e.target.checked)timer=setInterval(refreshStats,2000)};
+timer=setInterval(refreshStats,2000);
+async function clearStats(){
+  if(!confirm("确认清空系统账本？（RAG 轨迹保留）"))return;
+  await post("/api/reset_stats",{});refreshStats();
+}
+
+/* ---------- LLM 设置 ---------- */
+const PROVIDERS={
+  glm:{base:"https://open.bigmodel.cn/api/paas/v4",model:"glm-5.3-flash"},
+  deepseek:{base:"https://api.deepseek.com/v1",model:"deepseek-v4-flash"},
+  dashscope:{base:"https://dashscope.aliyuncs.com/compatible-mode/v1",model:"qwen-plus"},
+  custom:{base:"",model:""}
+};
+document.querySelector('#page-llm select')?.addEventListener("change",e=>{
+  const p=PROVIDERS[e.target.value]||{};
+  $("#llm-base").value=p.base||"";$("#llm-model").value=p.model||"";
+});
+async function loadLLM(){
+  const d=await fetch("/api/llm").then(r=>r.json());
+  if(d.base_url){$("#llm-base").value=d.base_url}
+  if(d.model){$("#llm-model").value=d.model}
+  $("#llm-key").placeholder=d.api_key_masked?`已配置 ${d.api_key_masked}（留空沿用）`:"首次必填";
+  $("#llm-now").innerHTML=
+    `引擎：<b class="${d.use_llm?"ok":""}">${d.use_llm?"LLM:"+esc(d.model):"规则 Mock（未配置 Key）"}</b><br>`+
+    `Base：${esc(d.base_url)}<br>Key：${esc(d.api_key_masked||"未配置")}<br>最近一次意图引擎：${esc(d.last_engine)}`;
+}
+async function saveLLM(){
+  const st=$("#llm-status");st.textContent="保存中…";
+  const r=await post("/api/llm_config",{
+    provider:$("#llm-provider").value,base_url:$("#llm-base").value,
+    model:$("#llm-model").value,api_key:$("#llm-key").value});
+  st.textContent=r.ok?r.message:`✗ ${r.error}`;
+  st.style.color=r.ok?"var(--green)":"var(--red)";
+  $("#llm-key").value="";
+  loadLLM();
+}
+async function testLLM(){
+  const st=$("#llm-status");st.textContent="测试中…";st.style.color="var(--sub)";
+  const box=$("#llm-test");box.style.display="block";box.className="result plain";box.textContent="调用 LLM 中（最长 20 秒）…";
+  const r=await post("/api/llm_test",{});
+  box.className="result "+(r.ok?"ok":"bad");
+  box.textContent=r.ok?`✓ 连通成功（${r.latency_ms} ms，${r.engine}）\n解析示例 → ${pretty(r.intent)}`
+                      :`✗ 失败（${r.latency_ms} ms）：${r.error}`;
+  st.textContent=r.ok?"测试通过":"测试失败";st.style.color=r.ok?"var(--green)":"var(--red)";
+  loadLLM();
+}
+async function loadSMTP(){
+  const d=await fetch("/api/smtp_config").then(r=>r.json());
+  $("#smtp-host").value=d.host;$("#smtp-port").value=d.port;$("#smtp-user").value=d.user;
+  $("#smtp-pass").value="";
+  $("#smtp-pass").placeholder=d.pass_masked?`已配置 ${d.pass_masked}（留空沿用）`:"首次必填";
+}
+async function saveSMTP(){
+  const st=$("#smtp-status");st.textContent="保存中…";
+  const r=await post("/api/smtp_save",{host:$("#smtp-host").value,port:$("#smtp-port").value,
+    user:$("#smtp-user").value,pass:$("#smtp-pass").value});
+  st.textContent=r.ok?"✓ 已保存并启用（重启后依然有效）":"✗ "+(r.error||"失败");
+  st.style.color=r.ok?"var(--green)":"var(--red)";
+  loadSMTP();
+}
+async function testSMTP(){
+  const st=$("#smtp-status");st.textContent="发送测试邮件中…";st.style.color="var(--sub)";
+  const r=await post("/api/smtp_test",{});
+  st.textContent=r.ok?"✓ 测试邮件已发出（查收件箱）":"✗ "+(r.error||"失败");
+  st.style.color=r.ok?"var(--green)":"var(--red)";
+}
+
+/* ---------- 控件树 ---------- */
+async function loadControls(){
+  const box=$("#ctl-tree");box.textContent="读取真实控件树中…";
+  try{
+    const d=await fetch("/api/controls").then(r=>r.json());
+    $("#ctl-meta").textContent=`后端: ${d.backend} | 元素 ${d.elements.length} 个`;
+    box.innerHTML=d.elements.map(e=>
+      `<div style="padding:1px 0">${"　".repeat(Math.min(e.depth||0,10))}[${esc(e.role)}] <b>${esc((e.name||"").slice(0,36))}</b> <span style="color:var(--sub)">${esc((e.app||"").slice(0,20))} ${JSON.stringify(e.bbox)}</span></div>`).join("")
+      ||'<div class="empty">无元素</div>';
+  }catch(e){box.textContent="读取失败: "+e}
+}
+
+/* ---------- 系统设置 ---------- */
+async function loadSettings(){
+  const d=await fetch("/api/settings").then(r=>r.json());
+  const s=d.settings;
+  $("#set-engine").value=s.llm_engine;
+  $("#set-temp").value=s.llm_temperature;
+  $("#set-level").value=s.default_level;
+  $("#set-confirm").value=s.escalation_confirm;
+  $("#set-delay").value=s.action_delay;
+  $("#set-finale").checked=!!s.planner_finale;
+  $("#set-protected").value=(s.protected_extra||[]).join(", ");
+  $("#set-ragk").value=s.rag_k;
+  if(!s.llm_available&&s.llm_engine==="llm")
+    $("#set-status").textContent="提示：LLM 引擎已选但未配置 Key，将自动走规则 Mock";
+  return s;
+}
+async function saveSettings(){
+  const st=$("#set-status");st.textContent="保存中…";st.style.color="var(--sub)";
+  const body={
+    llm_engine:$("#set-engine").value,
+    llm_temperature:Number($("#set-temp").value||0),
+    default_level:$("#set-level").value,
+    escalation_confirm:$("#set-confirm").value,
+    action_delay:Number($("#set-delay").value||0.3),
+    planner_finale:$("#set-finale").checked,
+    protected_extra:$("#set-protected").value.split(/[,，]/).map(x=>x.trim()).filter(Boolean),
+    rag_k:Number($("#set-ragk").value||3)
+  };
+  const r=await post("/api/settings",body);
+  st.textContent=r.ok?"✓ 已保存并即时生效":"✗ "+(r.error||"失败");
+  st.style.color=r.ok?"var(--green)":"var(--red)";
+  loadLLM();
+}
+async function resetSettings(){
+  if(!confirm("恢复全部默认设置？"))return;
+  const r=await post("/api/settings/reset",{});
+  if(r.ok){$("#set-status").textContent="✓ 已恢复默认";$("#set-status").style.color="var(--green)";loadSettings();loadLLM()}
+}
+$("#page-settings")&&0; /* 占位 */
+
+/* ---------- RAG ---------- */
+async function ragQuery(){
+  const q=$("#rag-q").value.trim();
+  const d=await fetch("/api/rag?q="+encodeURIComponent(q)+"&k=5").then(r=>r.json());
+  $("#rag-total").textContent=`知识库共 ${d.total} 条轨迹 · ${q?"相似检索":"最近"} ${d.hits.length} 条`;
+  $("#rag-hits").innerHTML=d.hits.length?d.hits.map(h=>`
+    <div class="hit"><b>${esc(h.input)}</b>
+      <div class="m">${esc(h.time)} · ${esc(h.result)}</div>
+      <div>${(h.actions||[]).map(a=>`<code>${esc(a)}</code>`).join(" ")}</div>
+    </div>`).join(""):'<div class="empty">知识库为空 —— 先到编排控制台跑几次</div>';
+}
+
+initTools();
+loadLLM();
+loadSMTP();
+loadSettings();
+/* 支持 #tools/#stats/#rag/#llm/#settings 直达对应页签 */
+{
+  const h=location.hash.slice(1);
+  if(h){const b=document.querySelector(`nav button[data-p="${h}"]`);if(b)b.click()}
+}
+</script>
+</body>
+</html>
