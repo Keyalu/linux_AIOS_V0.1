@@ -32,7 +32,8 @@ _CATEGORIES = {
     "find_large_files": "文件操作", "find_files": "文件操作",
     "cleanup_temp": "文件操作", "delete_file": "文件操作",
     "disk_usage": "系统设置", "system_check": "系统设置",
-    "open_url": "应用控制", "open_app": "应用控制", "send_email": "应用控制",
+    "open_url": "应用控制", "open_app": "应用控制", "click_element": "应用控制",
+    "send_email": "应用控制",
     "navigate": "应用控制", "switch_window": "应用控制", "create_folder": "应用控制",
     "weather": "信息查询", "search": "信息查询", "translate": "信息查询",
 }
@@ -55,6 +56,9 @@ _RULES: list[tuple[str, str, str]] = [
     (r"导航|前往|去到", "navigate", "在文件管理器中导航到路径"),
     (r"切换到|切换窗口|切到", "switch_window", "切换应用窗口"),
     (r"创建|新建", "create_folder", "创建文件夹"),
+    (r"点击(?:网页|页面|浏览器)|(?:网页|页面|浏览器)(?:里|中|上)(?:的)?点击",
+     "web_click", "在网页中点击元素（自动化浏览器）"),
+    (r"点击|点一下|单击|双击", "click_element", "点击界面控件（按名称/角色定位）"),
     (r"打开|启动|运行", "open_app", "打开应用"),
     (r"找(?!到)|查找", "find_files", "按条件搜索文件"),
 ]
@@ -109,6 +113,36 @@ def _extract_params(action: str, text: str) -> dict:
     elif action == "open_app":
         m = re.search(r"(?:打开|启动|运行)(?:一下)?[「'\"]?([\w\u4e00-\u9fa5.-]+)", text)
         params["app"] = m.group(1) if m else ""
+    elif action == "click_element":
+        # 控件名：优先引号包裹；否则取"点击"后的剩余实体（剥离角色词前缀）
+        q = _QUOTE_RE.search(text)
+        if q:
+            params["name"] = q.group(1).strip(" ，。、")
+        else:
+            rest = re.sub(r"^(?:请|帮我|麻烦)?(?:点击|点一下|单击|双击)(?:一下)?", "", text)
+            rest = re.sub(r"^(?:label|button|icon|图标|按钮|控件|菜单项)[，,、\s]*", "",
+                          rest, flags=re.I)
+            rest = re.sub(r"[，。、；:：]+$", "", rest).strip()
+            if rest:
+                params["name"] = rest
+        # 可选角色：label/按钮/图标/菜单项 → AT-SPI role 名（控件树精确定位用）
+        m_role = re.search(r"(?:label|button|icon|图标|按钮|菜单项)", text, re.I)
+        if m_role:
+            r = m_role.group(0).lower()
+            params["role"] = {"图标": "icon", "按钮": "push button",
+                              "菜单项": "menu item"}.get(r, r)
+    elif action == "web_click":
+        # 网页元素文本：取"点击"之后的实体（规则命中形如"点击网页里的X"/
+        # "在页面中点击X"）；LLM 路径直接给 params.text 时此处不覆盖
+        m = re.search(r"(?:点击(?:网页|页面|浏览器)|(?:网页|页面|浏览器)"
+                      r"(?:里|中|上)?(?:的)?点击)", text)
+        if m:
+            rest = text[m.end():]
+            rest = re.sub(r"^(?:里|中|上)?(?:的)?(?:这个|那个)?(?:链接|按钮)?",
+                          "", rest)
+            rest = re.sub(r"[，。、；:：]+$", "", rest).strip()
+            if rest:
+                params["text"] = rest
     elif action == "navigate":
         u = re.search(r"[「'\"]?(/[/\w.\-~]+)[「'\"]?", text)
         params["path"] = u.group(1) if u else "~/Documents"
@@ -272,14 +306,27 @@ class HostAgent:
                 continue
             for k in ("path", "src", "directory"):
                 v = (g.get("params") or {}).get(k)
-                if v:
-                    r = self._resolve_target(v, default_target)
-                    if r != v:
-                        g["params"][k] = r
+                if not v:
+                    continue
+                # 目录级动作（整理/查重/备份/清临时/找大文件）的作用域是
+                # 工作区，'.'/'..' 一律映射到 default_target —— 曾因规则
+                # 引擎把 path='.' 原样放行，organize 把整个项目根分类移动
+                # （实战事故：main.py/README.md 被移进 代码//文档/）
+                if v in (".", "./", "..", "../") \
+                        and g.get("action") in self._DIR_SCOPE_ACTIONS:
+                    g["params"][k] = default_target
+                    continue
+                r = self._resolve_target(v, default_target)
+                if r != v:
+                    g["params"][k] = r
             d = (g.get("params") or {}).get("dest")
             if d:
-                g["params"]["dest"] = self._resolve_target(d, default_target) \
-                    if os.path.isabs(os.path.expanduser(d)) else d
+                src_v = (g.get("params") or {}).get("src") or default_target
+                nd = self._normalize_dest(d, default_target, src_v)
+                if nd is None:
+                    g["params"].pop("dest", None)   # 幻觉路径 → 组2 重派生
+                else:
+                    g["params"]["dest"] = nd
 
         intent["user_text"] = user_input
         intent["intent_id"] = f"intent-{uuid.uuid4().hex[:8]}"
@@ -289,6 +336,27 @@ class HostAgent:
 
     _FILE_ACTIONS = {"organize", "find_duplicates", "backup", "find_large_files",
                      "find_files", "cleanup_temp", "delete_file"}
+    # 作用域为整个目录的动作：'.'/'..' 必须映射到工作区，禁止落到进程 CWD
+    _DIR_SCOPE_ACTIONS = {"organize", "find_duplicates", "backup",
+                          "find_large_files", "cleanup_temp"}
+
+    @staticmethod
+    def _normalize_dest(dest: str, default_target: str, src: str) -> str | None:
+        """备份/输出的 dest 归一。返回 None = 丢弃（交由组2 重派生）。
+
+        - 绝对 dest：父目录真实即接受（输出路径允许尚不存在）。此前对
+          "绝对但不存在"无脑回退 default_target，会把 dest 改写回源目录，
+          zip 名错位（test_s6 失败根因之一）；
+        - 相对 dest：锚定到 src 同级（工作区内）。此前原样放行，
+          make_archive 按 CWD 落盘，demo_task_backup.zip 曾被写进项目根。
+        """
+        d = os.path.expanduser(str(dest))
+        if os.path.isabs(d):
+            return d if os.path.isdir(os.path.dirname(d.rstrip("/\\"))) else None
+        s = os.path.expanduser(str(src))
+        base = os.path.dirname(s) if os.path.isabs(s) \
+            else os.path.dirname(default_target)
+        return os.path.join(base, d)
 
     @staticmethod
     def _resolve_target(raw: str, default_target: str) -> str:
@@ -317,15 +385,23 @@ class HostAgent:
         "可用 action：organize/find_duplicates/backup/find_large_files/find_files/"
         "cleanup_temp/delete_file/disk_usage/system_check/open_url/open_app/"
         "send_email/weather/search/translate/write_file/run_command/"
-        "navigate/create_folder/switch_window/take_screenshot\n"
+        "navigate/create_folder/switch_window/take_screenshot/click_element/"
+        "web_open/web_click/web_state\n"
         "截图链路：截图保存类需求 → take_screenshot(path=显式路径，"
         "如 /home/keyal/桌面/111/Agent_OS_v1.0/out/截图.png)；"
         "随后 send_email(attachment=同路径)/write_file 引用同一文件\n"
-        "桌面 GUI 场景优先用：打开/启动应用=open_app(app)；导航到路径=navigate(path)；"
+        "桌面 GUI 场景优先用：打开/启动应用=open_app(app)；"
+        "点击界面控件（任务栏图标/按钮/label）=click_element(name=控件显示名,"
+        " role=可选控件角色如 label/push button/icon)；"
+        "导航到路径=navigate(path)；"
         "创建文件夹=create_folder(name)；切换窗口=switch_window(app)；"
         "截屏=take_screenshot(path)\n"
-        "浏览器边界：open_url 仅能打开网址；浏览器内点击/读取页面内容不支持 —— "
-        "需要搜索结果的内容/链接时用 search(query)，不要用 open_url 变通\n"
+        "网页操作（自动化浏览器）：打开网页=web_open(url)，之后要在页面里"
+        "点击/操作 → web_click(text=元素可见文本子串)；读当前页 URL/标题="
+        "web_state()。带后续点击的网页任务必须用 web_open 而非 open_url\n"
+        "浏览器边界：open_url 仅用系统默认浏览器打开网址（无法继续点击）；"
+        "网页内容不在桌面控件树里 —— 不要用 click_element 点网页元素，"
+        "一律走 web_click；需要搜索结果的内容/链接时用 search(query)\n"
         "常用参数名：write_file 用 path(含文件名的完整路径)+content，写报告/摘录用它；"
         "run_command 用 cmd；open_url 用 url；"
         "send_email 用 to,subject,body,attachment(把文件发给对方时给文件的完整路径),"
@@ -341,6 +417,9 @@ class HostAgent:
         '{"action":"search","target":"","params":{"query":"智能体"}},'
         '{"action":"write_file","target":"/data/out/a.md","params":{'
         '"path":"/data/out/a.md","content":"{{prev_result}"}}]}\n'
+        "点击控件示例：输入:点击label，文件（点击任务栏里名字为“文件”的控件）"
+        ' → {"intent":"应用控制","goals":[{"action":"click_element","target":"文件",'
+        '"params":{"name":"文件","role":"label"}}]}\n'
         "intent 类别取第一个动作所属：文件操作/应用控制/系统设置/信息查询。"
     )
 
@@ -394,7 +473,8 @@ class HostAgent:
         primary = goals[0]
         params = _extract_params(primary["action"], text)
         target = (quote.group(1) if quote
-                  else params.get("path") or params.get("city") or params.get("url") or "")
+                  else params.get("name") or params.get("path") or params.get("city")
+                  or params.get("url") or "")
         confidence = 0.9 if len(goals) == 1 else 0.8
         return {"intent": _CATEGORIES.get(primary["action"], "文件操作"),
                 "action": primary["action"], "target": target,

@@ -27,6 +27,7 @@ _SKILL_ACTIONS = {
 # 应用控制类 GUI 动作 → GUI 步骤序列（任务书演示场景 1/2/3/5）
 _GUI_ACTIONS = {
     "open_app": "打开应用",
+    "click_element": "点击界面控件",
     "navigate": "导航到路径",
     "switch_window": "切换应用窗口",
     "create_folder": "创建文件夹",
@@ -38,6 +39,7 @@ _TOOL_ACTIONS = {
     "search": "mcp_search", "translate": "mcp_translate",
     "write_file": "write_file", "run_command": "run_command",
     "take_screenshot": "take_screenshot",
+    "web_open": "web_open", "web_click": "web_click", "web_state": "web_state",
 }
 
 
@@ -134,7 +136,8 @@ class TaskPlanner:
         if schema is None:
             unresolved.append(f"组4 能力清单中没有 {name}")
             return []
-        params = self._fill_params(name, schema, target, merged, goal)
+        params = self._fill_params(name, schema, target, merged, goal,
+                                   last_file_target=last_file_target)
         missing = [k for k in schema.get("inputSchema", {}).get("required", [])
                    if k not in params or params[k] in ("", None)]
         if missing:
@@ -149,7 +152,8 @@ class TaskPlanner:
         }]
 
     def _fill_params(self, name: str, schema: dict, target: str,
-                     intent: dict, goal: dict | None = None) -> dict:
+                     intent: dict, goal: dict | None = None,
+                     last_file_target: str | None = None) -> dict:
         """schema 驱动填参，三层优先级：
         1) intent.params（组1 实体抽取的显式参数）直接采用；
         2) 有缺口时，用 schema 第一个字符串参数接 目标路径/实体；
@@ -190,6 +194,12 @@ class TaskPlanner:
             if filler:
                 for pname, meta in props.items():
                     if meta.get("type") == "string" and pname not in params:
+                        # 路径类参数只接受像路径的 filler：文件动作在意图层已
+                        # 经 _resolve_target 成绝对路径；LLM 语义词（如"磁盘"）
+                        # 不像路径就不填，留给工具 default（disk_usage 默认查 /）
+                        if pname in ("path", "src", "directory", "dest") \
+                                and not str(filler).startswith(("/", "~", ".")):
+                            continue
                         params[pname] = filler
                         break
             if name == "backup_directory":
@@ -203,9 +213,34 @@ class TaskPlanner:
     # ---------------------------------------------------------- --
     def _gui_generic_steps(self, action: str, params_in: dict,
                            target: str, unresolved: list[str]) -> list[dict]:
-        """导航/切换窗口/创建文件夹 的 GUI 步骤序列（任务书场景 2/3/5）。"""
+        """导航/点击控件/切换窗口/创建文件夹 的 GUI 步骤序列（任务书场景 2/3/5）。"""
         gui: list[tuple[str, dict, str]] = []
-        if action == "navigate":
+        if action == "click_element":
+            name = params_in.get("name") or target
+            # dock/应用图标 → 启动通道：X11 下合成鼠标事件对 gnome-shell dock
+            # 不被接收（见 automator 注释），按钮也无 AT-SPI 动作——点图标的
+            # 语义就是打开应用，gtk-launch 是唯一可靠通道。仅当目标名主体
+            # 就是一个口语应用名时才路由，避免"我的文件报告"这类长描述误伤
+            route = self._known_app_name(name)
+            if route:
+                return self._gui_open_app_steps(name, unresolved)
+            role = params_in.get("role") or None
+            if not name:
+                unresolved.append("未识别要点击的控件名")
+                return []
+            el = None
+            if self._detector:
+                try:
+                    el = self._detector.find_element(role=role, name=name)
+                except Exception:
+                    el = None
+            query: dict = {"name": name}
+            if role:
+                query["role"] = role
+            gui = [("click",
+                    {"element": el} if el else {"element_query": query},
+                    f"点击 {name}" + ("（已定位）" if el else "（执行时定位）"))]
+        elif action == "navigate":
             path = params_in.get("path") or target
             gui = [("hotkey", {"keys": ["ctrl", "l"]}, "聚焦地址栏"),
                    ("type", {"text": path}, f"输入路径 {path}"),
@@ -227,24 +262,58 @@ class TaskPlanner:
         # 收尾命令由 plan() 统一追加
         return steps
 
+    # 中文应用口语名 → .desktop 文件名（gtk-launch 参数）。
+    # 实测：AT-SPI 坐标点击对 GNOME Shell dock 在 X11 下不可靠（合成事件
+    # 不被 gnome-shell 接收），命令行 gtk-launch 走 Freedesktop 标准，
+    # X11/Wayland 都可靠，不依赖坐标、不依赖 dock 位置。
+    _APP_DESKTOP = {
+        "firefox": "firefox", "火狐": "firefox",
+        "文件管理器": "nautilus", "文件": "nautilus", "files": "nautilus",
+        "终端": "gnome-terminal", "terminal": "gnome-terminal",
+        "应用中心": "gnome-software", "软件": "gnome-software",
+        "设置": "gnome-control-center", "settings": "gnome-control-center",
+        "文本编辑器": "gnome-text-editor", "text editor": "gnome-text-editor",
+        "图片": "eog", "帮助": "yelp",
+        "chrome": "google-chrome", "google-chrome": "google-chrome",
+        "code": "code", "vscode": "code",
+    }
+
+    @classmethod
+    def _app_desktop_name(cls, app: str) -> str:
+        a = (app or "").strip().lower()
+        for kw, desktop in cls._APP_DESKTOP.items():
+            if kw in a:
+                return desktop
+        return (app or "").strip()      # 查不到原样传，gtk-launch 自行报错
+
+    @classmethod
+    def _known_app_name(cls, name: str) -> str | None:
+        """点击目标若是口语应用名（dock 图标）→ 返回 .desktop 名，否则 None。
+
+        要求关键词覆盖目标名主体（len ≤ max(len(kw),4)+1），避免把
+        "我的文件报告"这类恰好含"文件"的长描述误路由成启动应用。"""
+        a = (name or "").strip().lower()
+        if not a:
+            return None
+        if a in cls._APP_DESKTOP:
+            return cls._APP_DESKTOP[a]
+        for kw in sorted(cls._APP_DESKTOP, key=len, reverse=True):
+            if kw in a and len(a) <= max(len(kw), 4) + 1:
+                return cls._APP_DESKTOP[kw]
+        return None
+
     def _gui_open_app_steps(self, app: str, unresolved: list[str]) -> list[dict]:
-        """应用控制：打开应用的 GUI 步骤（Super 键 → 输入名称 → 点击图标）。"""
+        """应用控制：打开应用。
+        走 GUI open_app 动作，由组3 Automator 执行 gtk-launch（比点 dock
+        坐标可靠：AT-SPI 合成鼠标事件对 GNOME Shell 不被接收）。"""
         if not app:
             unresolved.append("未识别要打开的应用名")
             return []
-        el = self._detector.find_element(name=app) if self._detector else None
-        return [
-            {"step_id": 1, "kind": "gui", "action": "hotkey", "target": app,
-             "params": {"keys": ["super"]}, "requires_admin": False,
-             "description": "按下 Super 打开活动概览"},
-            {"step_id": 2, "kind": "gui", "action": "type", "target": app,
-             "params": {"text": app}, "requires_admin": False,
-             "description": f"输入应用名 {app}"},
-            {"step_id": 3, "kind": "gui", "action": "click", "target": app,
-             "params": {"element": el} if el else {"element_query": {"name": app}},
-             "requires_admin": False,
-             "description": f"点击 {app} 图标" + ("（已定位）" if el else "（执行时定位）")},
-        ]
+        return [{"step_id": 1, "kind": "gui", "action": "open_app",
+                 "target": app,
+                 "params": {"app": app},
+                 "requires_admin": False,
+                 "description": f"启动 {app}"}]
 
     def _elements_for(self, steps: list[dict]) -> dict:
         """把 GUI 步骤引用的元素汇入 elements 字典（契约表第2组输出）。"""

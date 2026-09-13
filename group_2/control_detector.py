@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import time
+
 _BACKEND = "mock"
 try:
     import pyatspi                           # 传统绑定
@@ -30,8 +32,10 @@ except Exception:
 class ControlDetector:
     """控件检测器：遍历 AT-SPI 控件树，支持按角色/名称查找。"""
 
-    def __init__(self, max_depth: int = 6, max_nodes: int = 500,
-                 max_children: int = 40):
+    def __init__(self, max_depth: int = 24, max_nodes: int = 8000,
+                 max_children: int = 80):
+        # 预算与组3 AtspiIO.find_accessible 对齐：GNOME Shell 单棵 UI 树即
+        # 数千节点，500/6/40 的小预算会把 dock/概览项直接剪枝掉。
         self.backend = _BACKEND
         self.max_depth = max_depth
         self.max_nodes = max_nodes
@@ -78,19 +82,41 @@ class ControlDetector:
                         for j in range(min(n, self.max_children)):
                             stack.append((self._child(obj, j), aname, depth + 1))
         except Exception:
-            if not out:
-                return self._simulated_elements()
+            # 真实后端（pyatspi/atspi-gi）遍历异常：诚实返回空，由上层走
+            # element_query 现场定位；绝不静默塞假元素（否则 find_element
+            # 会在假 Files/Firefox 里找真实中文名，永远找不到，还误判后端正常）。
+            return []
         return out
 
     def find_element(self, role: str | None = None,
-                     name: str | None = None) -> dict | None:
-        """按角色/名称查找第一个匹配元素（组3 GUI 步骤定位用）。"""
-        for el in self.detect_elements():
-            if role and el["role"] != role:
-                continue
-            if name and name not in el["name"]:
-                continue
-            return el
+                     name: str | None = None,
+                     retries: int = 1, interval: float = 0.0) -> dict | None:
+        """按角色/名称查找元素（组3 GUI 步骤定位用）。
+
+        name 双向子串匹配：查询名 "文件管理器" 可命中树里的 "文件"，反之亦然
+        （GNOME 任务栏/概览结果项的 AT-SPI 名常与用户口语不一致）。
+        动态 UI（如 Super 后的概览搜索结果是异步渲染的）用 retries 在渲染
+        完成前短暂轮询；规划时预定位保持 retries=1 立即返回。"""
+        # GNOME 树里同名元素常出现多层：浅层是文本 label（不可点），
+        # 深层才是真 dock/按钮。find_element 必须优先可交互角色，
+        # 否则会点中一个不可点的文本标签，坐标对了也没反应。
+        clickable = ("push button", "button", "toggle button",
+                     "menu item", "check box", "icon")
+        for attempt in range(max(1, retries)):
+            fallback = None
+            for el in self.detect_elements():
+                if role and el["role"] != role:
+                    continue
+                if name and not (name in el["name"] or el["name"] in name):
+                    continue
+                if el["role"] in clickable:
+                    return el
+                if fallback is None:
+                    fallback = el
+            if fallback is not None:
+                return fallback
+            if attempt + 1 < retries:
+                time.sleep(interval)
         return None
 
     # ---------------------------------------------------------- --

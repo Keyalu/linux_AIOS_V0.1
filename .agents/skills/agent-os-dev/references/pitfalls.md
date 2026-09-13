@@ -25,9 +25,22 @@
 - 根因：确认后执行时**重新规划**——第二次 LLM 输出与第一次不同（LLM 随机性）。
 - 修复：`PENDING[token]` 存完整 `{intent, plan, check}`，`/api/execute` 原样执行，执行阶段零 LLM 调用。**任何新功能都不得在确认后重新规划。**
 
+### 现象：浏览器里根本搜不到网页元素（网页点击/读取不成立）
+- 根因：本机浏览器全是 snap 包，**AppArmor 把 snap 应用挡在 a11y 总线外**——应用注册为"(无名)"、树 child_count=-1，Cache 与遍历接口全拦（Firefox snap / Chromium snap 双双实测，2026-09）。AT-SPI 网页自动化在此环境是死路，与控件树预算/深度无关。
+- 修复：网页操作走 **CDP（Chrome DevTools Protocol）**——`src/web_automation.py`（零依赖 RFC6455 WebSocket 客户端 + Runtime.evaluate 定位 + Input.dispatchMouseEvent 真实点击），AppArmor 不拦 localhost。已实测 open→find→click→URL 跳转全链路。
+- 教训：① snap 化 Ubuntu 上"用 a11y 控制浏览器"的前提先验证 AppArmor；② CDP 必须用**独立 user-data-dir**（否则被单实例代理吞掉）+ `/json/new` 专用标签页（复用旧标签会被内存节省丢弃，evaluate 永久无响应）；③ 同进程测试套件里改 `AIOS_CDP_PORT`/`AIOS_WEB_BROWSER` 环境变量必须恢复并复位 `_AUTO` 单例，否则污染后续测试。
+
+### 现象：orchestrate 卡在 LLM 无响应 / 页面操作静默无效果
+- 排查顺序：先探测 `http://127.0.0.1:9222/json/version`（无 curl 用 python urllib）确认 CDP 端口，再看窗口标题是否变化、`session_log` 里 `effect` 字段。
+
 ### 现象：LLM 参数幻觉（把上一步整个结果对象塞进字符串参数、编造不存在的文件路径）
 - 根因：LLM 输出随机性 + 提示词动作表缺项（LLM 不知道某工具存在时只能变通幻觉）。
 - 修复三层：组1 提示词动作表与参数规范保持最新（**加新工具必须同步**）；组1 后处理归一（dry_run/attachment/路径解析）；组2 `_fill_params` 类型防御（字符串参数收到 dict/list 一律丢弃）。
+
+### 现象：organize 把项目根/进程 CWD 当工作区整理了（源码被移进 代码//文档/）
+- 根因：路径归一漏洞三连。① 规则引擎/LLM 给目录级动作（organize/find_duplicates/backup 等）填 `path='.'`，`_resolve_target` 对"存在即返回"的相对路径短路，原样放行 → organize 的作用域变成进程 CWD；② 相对 `dest`（如 demo_task_backup）原样放行 → `make_archive` 按进程 CWD 落盘，zip 写进项目根；③ 绝对但**尚不存在**的 `dest` 被 `_resolve_target` 回退成 default_target（=源目录本身），zip 名错位。
+- 修复（group_1/host_agent.py）：目录级动作的 `'.'/'..'` 一律映射 default_target（`_DIR_SCOPE_ACTIONS`）；dest 归一进 `_normalize_dest`（绝对 dest 父目录真实才接受，否则丢弃交组2 重派生；相对 dest 锚定 src 同级）。
+- 教训：**目录级动作的作用域永远不能是"进程恰好站在哪里"**；输出路径允许不存在，不能拿"存在性"当校验标准。回归测试：`TestIntentPathNormalization`（use_llm=False 确定性复现）。
 
 ### 现象：审计对账 FAIL、步骤计数对不上
 - 根因 1：会话状态累积（见前端段第 3 条同源问题）。
@@ -51,6 +64,11 @@
 ### 现象：queryText / queryAction 报 AttributeError
 - 根因：那是 pyatspi 的包装 API；Atspi GI 的接口方法**扁平化在 Accessible 上**（acc.set_text_contents / acc.do_action / acc.get_n_actions）。
 - 教训：写 AT-SPI 代码前先用 `dir(acc)` 探测真实 API 形状，不要凭 pyatspi 文档硬写。
+
+### 现象：控件树坐标点击落点系统性偏移（GTK 应用内尤甚，shell 元素反而准）
+- 根因：**GTK4 应用在 X11 下 a11y extents 停留在窗口创建时的默认几何**，窗口被移动/缩放后不刷新（实测 Nautilus 报 (0,0,890,550)，X 真值 1012x672+317+88，间隔 2 秒采样不变，误差非等比——不是缩放变换，是纯陈旧数据）；对照 gnome-shell（gjs 应用）树坐标与 X root 完全一致。X11 + 缩放 1.0 下与屏幕缩放无关。
+- 修复：`group_3/coord_check.py` 以元素顶层 frame 为锚，用 xwininfo 真值做逐轴仿射校正（true = a*reported + b）；shell 树信任跳过；Wayland/无 DISPLAY/xwininfo 缺失自动停用；点击主路径改为 API DoAction 语义选动作（press/click/open…，不再盲选 index 0），坐标只兜底。
+- 教训：AT-SPI 坐标必须与 X 端真值交叉验证后才可信；`bbox[0] >= 0` 式有效性判定会误杀多显示器合法负坐标（哨兵只认 INT32_MIN）。
 
 ### 现象：GTK4 应用（gnome-text-editor 等）里找不到目标控件
 - 根因：libadwaita 应用 panel 链嵌套极深（实测 14+ 层），浅深度/小预算的搜索走不到。

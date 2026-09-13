@@ -40,6 +40,17 @@ _KSYM_SPECIAL = {"/": "slash", ".": "period", "-": "minus", "_": "underscore",
                  "@": "at", "#": "numbersign", "%": "percent", "+": "plus",
                  "'": "apostrophe", "\\": "backslash"}
 
+# 可交互角色（与 group_2/control_detector.py find_element 的清单一致；
+# 组间解耦纪律：组3 不 import 组2，此处复制小常量）
+_CLICKABLE_ROLES = ("push button", "button", "toggle button",
+                    "menu item", "check box", "icon", "radio button",
+                    "page tab", "link")
+
+# 点击类动作名优先级（小写子串匹配）。语义选动作用——不再盲选 index 0
+# （首个动作可能是 showContextMenu 等非点击语义）。
+_CLICK_ACTION_KEYWORDS = ("press", "click", "activate", "open", "launch",
+                          "toggle", "default", "expand")
+
 
 def available() -> bool:
     return _OK
@@ -91,11 +102,15 @@ class AtspiIO:
         return self._desktop
 
     def find_accessible(self, name: str = "", role: str = "",
-                        contains: bool = True, app_name: str = ""):
+                        contains: bool = True, app_name: str = "",
+                        clickable_only: bool = False):
         """按名称/角色查找可访问对象。
 
         app_name：先定位到指定应用（如 gnome-text-editor），避免全桌面
-        广度搜索在大型应用树上耗尽预算。"""
+        广度搜索在大型应用树上耗尽预算。
+        clickable_only：优先可交互角色（与组2 find_element 的 clickable
+        清单保持一致）——同名元素浅层常是不可点的文本 label，深层才是
+        真按钮/图标；找齐全树仍无可交互者才退回首个名字匹配。"""
         desk = self._desk()
         roots = []
         if app_name:
@@ -113,6 +128,7 @@ class AtspiIO:
         queue = list(roots)
         seen = 0
         want = (name or "").lower()
+        fallback = None
         while queue and seen < 8000:
             obj, depth = queue.pop(0)
             seen += 1
@@ -125,7 +141,12 @@ class AtspiIO:
                 ok_name = (not want) or (want in nm if contains else nm == want)
                 ok_role = (not role) or (role in rl)
                 if ok_name and ok_role:
-                    return obj
+                    if not clickable_only:
+                        return obj
+                    if rl in _CLICKABLE_ROLES:
+                        return obj
+                    if fallback is None:
+                        fallback = obj
             try:
                 n = self._child_count(obj)
             except Exception:
@@ -133,7 +154,7 @@ class AtspiIO:
             if depth < 24:
                 for i in range(min(n, 80)):
                     queue.append((self._child(obj, i), depth + 1))
-        return None
+        return fallback
 
     # -------------------------------------------------- API 级动作 --
     # 注意：Atspi GI 的接口方法扁平化在 Accessible 上（无 queryText/queryAction 包装）
@@ -153,6 +174,53 @@ class AtspiIO:
             return bool(acc.do_action(index))
         except Exception:
             return False
+
+    @classmethod
+    def action_index(cls, acc) -> int | None:
+        """语义选动作：按点击类动作名优先级挑一个；拿不准返回 None。
+
+        多个动作但无一匹配点击语义时不猜（index 0 可能是 showContextMenu），
+        交回坐标路径；唯一动作即使名字陌生也用它（总比点错坐标强）。"""
+        try:
+            names = [(acc.get_action_name(i) or "").lower()
+                     for i in range(acc.get_n_actions())]
+        except Exception:
+            return None
+        if not names:
+            return None
+        for kw in _CLICK_ACTION_KEYWORDS:
+            for i, n in enumerate(names):
+                if kw in n:
+                    return i
+        return 0 if len(names) == 1 else None
+
+    @staticmethod
+    def extents(acc) -> list[int]:
+        """屏幕坐标 extents（CoordType.SCREEN）；失败返回空列表。"""
+        try:
+            e = acc.get_extents(1)
+            return [int(e.x), int(e.y), int(e.width), int(e.height)]
+        except Exception:
+            return []
+
+    def window_names(self) -> list[str]:
+        """当前所有顶层窗口标题（非递归、浅遍历，~O(应用数) 次总线调用）。
+
+        用途：execute_step 的 before/after 状态快照 —— API 动作"返回 True
+        但界面无变化"的静默 no-op 由此留痕（如新窗口出现可对账）。"""
+        out: list[str] = []
+        try:
+            desk = self._desk()
+            for i in range(self._child_count(desk)):
+                app = self._child(desk, i)
+                for j in range(self._child_count(app)):
+                    f = self._child(app, j)
+                    nm = self._name(f)
+                    if nm:
+                        out.append(nm)
+        except Exception:
+            pass
+        return out[:20]
 
     @staticmethod
     def set_text(acc, text: str) -> bool:

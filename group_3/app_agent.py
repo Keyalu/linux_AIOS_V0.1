@@ -116,11 +116,14 @@ class AppAgent:
             if el is None and params.get("element_query"):
                 el = self._detector_find(params["element_query"])
             result = self.automator.execute_step(step, el)
+            if step.get("action") == "click":
+                result = self._verify_click(step, params, el, result)
             tool_result = {"success": result.get("success", True),
                            "result": result.get("message", ""),
                            "before_state": result.get("before_state"),
                            "after_state": result.get("after_state"),
-                           "simulated": result.get("simulated", True)}
+                           "simulated": result.get("simulated", True),
+                           "effect": result.get("effect", "")}
             level_used = "public"
         else:
             # 工具/技能步骤：走组4 公开契约，带提权流与自愈流
@@ -206,10 +209,44 @@ class AppAgent:
                     return retry
         return result
 
+    def _verify_click(self, step, params, el, result) -> dict:
+        """点击效果标注 + 无可观测效果时重定位重试一次（最多一次）。
+
+        窗口集合变化只是"可观测效果"的弱信号（页面内点击本就不动窗口），
+        因此只标注 effect 不判失败；重试仅在 element_query 能再定位出
+        不同元素时发生，避免无谓的重复树遍历。"""
+        if result.get("mock") or result.get("api_action"):
+            return result
+        before = (result.get("before_state") or {}).get("windows") or []
+        after = (result.get("after_state") or {}).get("windows") or []
+        if before and after != before:
+            result.setdefault("effect", "window-changed")
+            return result
+        result.setdefault("effect", "no-visible-change")
+        query = params.get("element_query")
+        if not query:
+            return result
+        el2 = self._detector_find(query)
+        if el2 is None or el2 == el:
+            return result
+        retry = self.automator.execute_step(step, el2)
+        retry["retried"] = True
+        retry.setdefault("effect", "no-visible-change")
+        return retry
+
     def _detector_find(self, query: dict):
-        """延迟注入的控件查找（避免组3 硬依赖组2，运行期才用到）。"""
+        """延迟注入的控件查找（避免组3 硬依赖组2，运行期才用到）。
+
+        element_query 来自"上一步操作后才出现的动态 UI"（如 Super 概览的
+        搜索结果），异步渲染有延迟：这里自动短暂轮询，给结果项留出注册进
+        AT-SPI 树的时间。"""
         detector = getattr(self, "_detector", None)
-        return detector.find_element(**query) if detector else None
+        if detector is None:
+            return None
+        q = dict(query)
+        q.setdefault("retries", 3)
+        q.setdefault("interval", 0.5)
+        return detector.find_element(**q)
 
     def attach_detector(self, detector) -> None:
         self._detector = detector

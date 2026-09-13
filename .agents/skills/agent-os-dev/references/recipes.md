@@ -49,3 +49,22 @@
 2. 真实数据源实现：纯标准库 urllib，设 timeout，失败降级 `[Mock·离线]` 标记文本（参考 _real_weather/_real_search/_real_translate）。
 3. schema 注册进 `registry.register(name, func, ToolSchema(...))`。
 4. 若要进编排：组1 词典/提示词 + 组2 映射（参照配方 2 的 weather 路径）。
+
+## 配方 6：加网页自动化能力（CDP 通道）
+
+网页点击不走 AT-SPI（snap 浏览器被 AppArmor 挡在 a11y 总线外，见 pitfalls），走
+`src/web_automation.py` 的 CDP 通道。扩展步骤：
+
+1. 高层操作加在 `WebAutomation` 类：`_cmd(method, params)` 发命令，
+   JS 定位用 `Runtime.evaluate` + `json.dumps` 嵌入参数（防注入），交互用
+   `Input.dispatchMouseEvent`（真实输入事件）。
+2. 组4 工具封装：`web_xxx() -> {"success", "result"/"error", "simulated"?}`，
+   浏览器不可用 → `[Mock]` 标记 + simulated=True（不谎报真实成功）；
+   schema 进 `WEB_SCHEMAS`，注册进 `register_web_tools`。
+3. **同步组1**：`_SYSTEM_PROMPT` 动作清单 + 参数说明 + `_RULES`（网页类规则
+   放在泛化"点击"规则之前，防 span 重叠抢走）+ `_extract_params` 分支。
+4. **同步组2**：`_TOOL_ACTIONS` 加映射；web_click 的 text 是必填参数，注意
+   `_fill_params` 的路径类防御不适用于它。
+5. 测试：WS 帧回路（本地假服务器，见 TestWebAutomation）、Mock 降级（改
+   `AIOS_WEB_BROWSER` 环境变量后必须恢复+复位 `_AUTO` 单例）、真机集成
+   （skipUnless 有浏览器）。

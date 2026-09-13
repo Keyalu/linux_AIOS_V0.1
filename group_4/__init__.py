@@ -28,6 +28,7 @@ from src.skill_library import SkillLibrary          # noqa: E402
 from src.mcp_connector import MCPConnector          # noqa: E402
 from src.stats import ToolStats                     # noqa: E402
 from src.real_tools import register_real_tools      # noqa: E402
+from src.web_automation import register_web_tools    # noqa: E402
 from src.interfaces import (                        # noqa: E402
     PermissionLevel, ToolSchema, ToolResult, ToolParam, ToolParamType,
 )
@@ -42,11 +43,13 @@ __all__ = [
 def make_stack(stats: ToolStats | None = None,
                include_mcp: bool = True,
                include_real: bool = True,
+               include_web: bool = True,
                ):
     """组装一套组4 模块栈：ToolRegistry + SkillLibrary (+ MCP Mock + 真实动作)。
 
     返回 (stats, registry, skills)。传入自定义 stats 可把统计落到指定文件
     （ToolStats 会自动加载已有账本并追加，实现跨运行累积）。
+    注册只做 schema 声明，不触发网络/浏览器动作（web 工具惰性启动）。
     """
     stats = stats if stats is not None else ToolStats()
     registry = ToolRegistry(stats=stats)
@@ -55,6 +58,8 @@ def make_stack(stats: ToolStats | None = None,
         MCPConnector().register_mock_tools(registry)   # 幂等
     if include_real:
         register_real_tools(registry)                  # open_url / send_email（可选动作）
+    if include_web:
+        register_web_tools(registry)                   # web_open / web_click / web_state
     return stats, registry, skills
 
 

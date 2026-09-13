@@ -69,7 +69,11 @@ def open_url(url: str, new: int = 0) -> dict:
 # ============================================================
 
 def take_screenshot(path: str = "") -> dict:
-    """截取当前屏幕并保存为图片（X11 会话，Gdk 根窗口抓取）。"""
+    """截取当前屏幕并保存为图片（X11 会话，Gdk 根窗口抓取）。
+
+    截图前固定等待 2s：GUI 操作（点击/开应用/切窗口）后画面通常还在
+    渲染，立即抓取会拿到过渡帧；等两秒让画面稳定再截。"""
+    time.sleep(2)
     try:
         import gi
         gi.require_version("Gdk", "3.0")
