@@ -28,7 +28,8 @@ import threading as _threading                 # noqa: E402
 from src.web_automation import (               # noqa: E402
     _WebSocket, web_click as _web_click, web_open as _web_open,
     web_state as _web_state, register_web_tools,
-)
+    llm_answer as _llm_answer,
+)  # web_search/web_extract 在集成用例内局部导入
 from src.tool_registry import ToolRegistry     # noqa: E402
 
 
@@ -58,9 +59,9 @@ class TestScenarios(IntegrationBase):
 
     def test_s2_navigate_path(self):
         b = self.coordinator.orchestrate("导航到 /home/user/Documents")
-        types = [s for s in b["results"] if s["name"] == "type"]
-        self.assertTrue(types and "/home/user/Documents" in
-                        json.dumps(types[0]["params_sent"]))
+        nav = [s for s in b["results"] if s["name"] == "navigate"]
+        self.assertTrue(nav and "/home/user/Documents" in
+                        json.dumps(nav[0]["params_sent"]))
 
     def test_s3_create_folder(self):
         b = self.coordinator.orchestrate("创建 project 文件夹")
@@ -368,11 +369,21 @@ class TestWebAutomation(unittest.TestCase):
         reg = ToolRegistry()
         register_web_tools(reg)
         names = {s.to_dict()["name"] for s in reg.list_tools()}
-        self.assertTrue({"web_open", "web_click", "web_state"} <= names)
+        self.assertTrue({"web_search", "web_open", "web_click",
+                         "web_state", "web_extract", "llm_answer"} <= names)
         # web_click 参数防御：text/selector 全空 → 报参数错误而非崩溃
         r = _web_click()
         self.assertFalse(r["success"])
         self.assertIn("text / selector", r["error"])
+
+    def test_rules_search_routes_to_web_search(self):
+        """裸'搜索'走浏览器结果页；'搜索文件'不被抢走。"""
+        host = HostAgent(use_llm=False)
+        it = host.understand_intent('搜索"湖南大学"')
+        self.assertEqual([g["action"] for g in it["goals"]], ["web_search"])
+        self.assertEqual(it["params"].get("query"), "湖南大学")
+        it2 = host.understand_intent("搜索文件")
+        self.assertNotIn("web_search", [g["action"] for g in it2["goals"]])
 
 
 class TestPlannerRouting(unittest.TestCase):
@@ -430,6 +441,266 @@ class TestWebCDPIntegration(unittest.TestCase):
         self.assertIn("iana.org", r2["result"]["after"]["url"])
         r3 = _web_state()
         self.assertIn("iana.org", r3["result"]["url"])
+
+    def test_web_search_opens_results_page(self):
+        import src.web_automation as _wa
+        from src.web_automation import web_search as _ws
+        r = _ws("湖南大学")
+        self.assertTrue(r["success"], r)
+        self.assertIn("bing.com/search", r["result"]["url"])
+        self.assertIn("%E6%B9%96%E5%8D%97", r["result"]["url"])  # 湖南已编码
+        self.assertTrue(r["result"]["title"])
+        _wa._AUTO = None                        # 不影响其它用例的连接状态
+
+
+class TestRoutePolicy(unittest.TestCase):
+    """方案一：歧义决策表 + 计划图消费分析，通道确定性改写。"""
+
+    SCHEMAS = {
+        "web_search": {"permission": "public",
+                       "inputSchema": {"required": ["query"],
+                                       "properties": {"query": {"type": "string"}}}},
+        "mcp_search": {"permission": "public",
+                       "inputSchema": {"required": ["query"],
+                                       "properties": {"query": {"type": "string"}}}},
+        "open_url": {"permission": "public",
+                     "inputSchema": {"required": ["url"],
+                                     "properties": {"url": {"type": "string"}}}},
+        "web_open": {"permission": "public",
+                     "inputSchema": {"required": ["url"],
+                                     "properties": {"url": {"type": "string"}}}},
+        "write_file": {"permission": "user",
+                       "inputSchema": {"required": ["path", "content"],
+                                       "properties": {"path": {"type": "string"},
+                                                      "content": {"type": "string"}}}},
+    }
+
+    def _steps(self, *action_params):
+        return [{"step_id": i, "kind": "tool", "action": a, "target": "",
+                 "params": p, "requires_admin": False, "description": a}
+                for i, (a, p) in enumerate(action_params, 1)]
+
+    def test_consumed_outputs_marks_referenced_steps(self):
+        from group_2.route_policy import consumed_outputs
+        steps = self._steps(
+            ("mcp_search", {"query": "x"}),
+            ("write_file", {"path": "/a.md", "content": "{{prev_result}}}"}),
+            ("web_state", {}))
+        self.assertEqual(consumed_outputs(steps), {1})
+        steps2 = self._steps(("a", {}), ("b", {}),
+                             ("c", {"x": "{{step1.result}}"}))
+        self.assertEqual(consumed_outputs(steps2), {1})
+        # 残缺形态（提示词示例曾长期带此错）也要识别
+        steps3 = self._steps(("mcp_search", {"query": "x"}),
+                             ("write_file", {"path": "/a.md",
+                                             "content": "{{prev_result}"}))
+        self.assertEqual(consumed_outputs(steps3), {1})
+        self.assertEqual(consumed_outputs(self._steps(("a", {}))), set())
+
+    def test_unconsumed_search_upgrades_to_web_search(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("mcp_search", {"query": "湖南大学"}))
+        routes = apply_route_policy("搜索湖南大学", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "web_search")
+        self.assertEqual(routes[0]["from"], "mcp_search")
+        self.assertIn("可观测", steps[0]["route_reason"])
+
+    def test_consumed_search_stays_data_channel(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("mcp_search", {"query": "智能体"}),
+                            ("write_file", {"path": "/a.md",
+                                            "content": "{{prev_result}}"}))
+        routes = apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "mcp_search")
+        self.assertEqual(routes, [])
+
+    def test_web_search_downgrades_to_mcp_when_consumed(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("web_search", {"query": "智能体"}),
+                            ("write_file", {"path": "/a.md",
+                                            "content": "{{prev_result}}"}))
+        routes = apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "mcp_search")
+        self.assertEqual(routes[0]["to"], "mcp_search")
+
+    def test_open_url_with_keywords_routes_to_web_search(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("open_url", {"url": "湖南大学"}))
+        apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "web_search")
+        self.assertEqual(steps[0]["params"]["query"], "湖南大学")
+
+    def test_open_url_before_web_click_upgrades_to_web_open(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("open_url", {"url": "https://example.com"}),
+                            ("web_click", {"text": "More"}))
+        apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "web_open")
+
+    def test_open_url_alone_stays(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("open_url", {"url": "https://example.com"}))
+        routes = apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "open_url")
+        self.assertEqual(routes, [])
+
+    def test_missing_required_param_blocks_rewrite(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("mcp_search", {}))     # 无 query 且无 target
+        routes = apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["action"], "mcp_search")   # 宁缺毋滥
+        self.assertIn("未改写", steps[0]["route_reason"])
+
+    def test_bare_domain_normalized_for_web_open(self):
+        from group_2.route_policy import apply_route_policy
+        steps = self._steps(("web_open", {"url": "www.baidu.com"}))
+        apply_route_policy("", steps, self.SCHEMAS)
+        self.assertEqual(steps[0]["params"]["url"], "https://www.baidu.com")
+
+    def test_planner_routes_data_chain_and_bare_search(self):
+        planner = TaskPlanner(schemas=self.SCHEMAS)
+        planner.add_finale = False
+        chain = planner.plan({"user_text": "搜索 湖南大学 并写入",
+                              "goals": [
+                                  {"action": "search",
+                                   "params": {"query": "湖南大学"}},
+                                  {"action": "write_file",
+                                   "params": {"path": "/tmp/a.md",
+                                              "content": "{{prev_result}}"}}]})
+        self.assertEqual(chain["steps"][0]["action"], "mcp_search")
+        bare = planner.plan({"user_text": '搜索"湖南大学"',
+                             "goals": [{"action": "search",
+                                        "params": {"query": "湖南大学"}}]})
+        self.assertEqual(bare["steps"][0]["action"], "web_search")
+        self.assertTrue(bare["routes"])
+
+
+
+class TestIntelligence(unittest.TestCase):
+    """智能化三件套：llm_answer/web_extract、RAG 记忆入参、失败反思。"""
+
+    def test_llm_answer_with_fake_chat(self):
+        import src.llm_client as llm
+        old_chat, old_cfg = llm.chat, llm.load_config
+        llm.chat = lambda prompt, system="", **kw: "官网是 https://www.hnu.edu.cn"
+        try:
+            r = _llm_answer(question="官网是什么", text="湖南大学主页 hnu.edu.cn")
+            self.assertTrue(r["success"], r)
+            self.assertIn("hnu.edu.cn", r["result"]["answer"])
+        finally:
+            llm.chat, llm.load_config = old_chat, old_cfg
+
+    def test_llm_answer_honest_fail_without_config(self):
+        import src.llm_client as llm
+        old_chat, old_cfg = llm.chat, llm.load_config
+        llm.load_config = lambda: {}      # 无配置 → 真 chat 返回 None，不发请求
+        try:
+            r = _llm_answer(question="总结一下", text="内容")
+            self.assertFalse(r["success"])
+            self.assertIn("LLM", r["error"])
+        finally:
+            llm.chat, llm.load_config = old_chat, old_cfg
+
+    def test_rules_answer_and_extract(self):
+        host = HostAgent(use_llm=False)
+        it = host.understand_intent("总结一下")
+        self.assertEqual([g["action"] for g in it["goals"]], ["answer"])
+        it2 = host.understand_intent("搜索 湖南大学 并告诉我 官网网址")
+        self.assertEqual([g["action"] for g in it2["goals"]],
+                         ["web_search", "answer"])
+
+    def test_answer_text_auto_wired_and_consumed(self):
+        """answer 的 text 自动接 {{prev_result}} → 消费分析把前置搜索升级为
+        数据通道 mcp_search（意图-执行一致性的闭环验证）。"""
+        from group_2.route_policy import apply_route_policy
+        schemas = {
+            "web_search": {"permission": "public", "inputSchema": {
+                "required": ["query"], "properties": {"query": {"type": "string"}}}},
+            "mcp_search": {"permission": "public", "inputSchema": {
+                "required": ["query"], "properties": {"query": {"type": "string"}}}},
+            "llm_answer": {"permission": "public", "inputSchema": {
+                "required": [], "properties": {"question": {"type": "string"},
+                                               "text": {"type": "string"}}}},
+        }
+        planner = TaskPlanner(schemas=schemas)
+        planner.add_finale = False
+        plan = planner.plan({"user_text": '搜索"湖南大学"并告诉我官网',
+                             "goals": [
+                                 {"action": "web_search",
+                                  "params": {"query": "湖南大学"}},
+                                 {"action": "answer",
+                                  "params": {"question": "官网是什么"}}]})
+        self.assertEqual(plan["steps"][0]["action"], "mcp_search")
+        self.assertEqual(plan["steps"][1]["params"]["text"], "{{prev_result}}")
+
+    def test_repair_intent_with_fake_chat(self):
+        import src.llm_client as llm
+        old_chat = llm.chat
+        llm.chat = lambda *a, **kw: json.dumps(
+            {"goals": [{"action": "write_file", "target": "/tmp/ok.md",
+                        "params": {"path": "/tmp/ok.md", "content": "fixed"}}]})
+        try:
+            host = HostAgent(use_llm=False)
+            it = host.repair_intent(
+                "写一个文件 /root/x.md 内容 hi",
+                [{"step": 1, "name": "write_file",
+                  "params": {"path": "/root/x.md"},
+                  "error": "拒绝写入受保护路径"}],
+                ["write_file", "read_file"],
+                {"target": "/root/x.md"})
+            self.assertIsNotNone(it)
+            self.assertEqual(it["goals"][0]["params"]["path"], "/tmp/ok.md")
+        finally:
+            llm.chat = old_chat
+
+    def test_web_click_consumer_keeps_page_channel(self):
+        """搜索 → web_click：消费方要的是"结果页"而非数据，
+        通道应保持 web_search（曾误降级为 mcp_search 导致无页可点）。"""
+        from group_2.route_policy import apply_route_policy
+        schemas = {
+            "web_search": {"permission": "public", "inputSchema": {
+                "required": ["query"], "properties": {"query": {"type": "string"}}}},
+            "mcp_search": {"permission": "public", "inputSchema": {
+                "required": ["query"], "properties": {"query": {"type": "string"}}}},
+            "web_click": {"permission": "public", "inputSchema": {
+                "required": [], "properties": {"text": {"type": "string"}}}},
+        }
+        planner = TaskPlanner(schemas=schemas)
+        planner.add_finale = False
+        # 提案 mcp_search（数据通道）→ 消费方是 web_click → 改写回 web_search
+        plan = planner.plan({"user_text": "搜索湖南大学，并点击第一条结果",
+                             "goals": [
+                                 {"action": "search",
+                                  "params": {"query": "湖南大学"}},
+                                 {"action": "web_click",
+                                  "params": {"text": "{{prev_result}"}}]})
+        self.assertEqual(plan["steps"][0]["action"], "web_search")
+        self.assertIn("搜索页", plan["steps"][0].get("route_reason", ""))
+
+    def test_llm_invented_variable_placeholder_dropped(self):
+        """LLM 发明 shell 风格变量占位（$demo_task_path）→ 归一层丢弃，
+        兜底填充接手（实战：该变量原样传给工具必然"目录不存在"）。"""
+        host = HostAgent(use_llm=False)
+        intent = {"intent": "文件操作", "user_text": "整理 demo_task 并查重",
+                  "target": "/tmp/ws/demo_task",
+                  "goals": [{"action": "find_duplicates",
+                             "params": {"path": "$demo_task_path"}},
+                            {"action": "backup",
+                             "params": {"src": "$demo_task_path",
+                                        "dest": "$backup_dest"}}]}
+        fixed = host._finalize_intent(intent, intent["user_text"], "/tmp/ws/demo_task")
+        g0, g1 = fixed["goals"]
+        self.assertNotIn("path", g0["params"])          # 变量占位被丢弃
+        self.assertNotIn("dest", g1["params"])          # dest 交组2 重派生
+        self.assertNotIn("src", g1["params"])           # src 交组2 兜底填充
+
+    def test_memory_kwarg_accepted_by_rules_path(self):
+        host = HostAgent(use_llm=False)
+        it = host.understand_intent("查询长沙天气",
+                                    memory=[{"input": "查询长沙天气",
+                                             "actions": ["tool:weather"],
+                                             "result": "1/1 步成功"}])
+        self.assertEqual(it["goals"][0]["action"], "weather")
 
 
 class TestDemoMatrix(unittest.TestCase):

@@ -53,9 +53,11 @@ class MockSkillLibrary(ISkillLibrary):
     def _register_defaults(self) -> None:
         """注册核心 Skill 的 Mock 版本。"""
 
+        # 万能空函数：所有 Mock 技能都指向它
         def _noop(**kwargs: Any) -> dict:
             return {"success": True, "result": "[Mock] 模拟执行"}
 
+        # 与真实 SkillLibrary 同名的 8 个技能
         skills = [
             ("organize_downloads", "整理下载目录", ["path"]),
             ("system_check", "检查系统状态", []),

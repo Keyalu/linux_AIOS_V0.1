@@ -47,6 +47,7 @@ class RateLimiter:
 
     def acquire(self) -> None:
         """阻塞直到获得一个执行令牌。"""
+        # 令牌桶：把下一个可用时刻后推 interval，密集提交自然被拉开间距
         with self._lock:
             now = time.monotonic()
             slot = max(now, self._next_slot)
@@ -151,6 +152,7 @@ class BatchExecutor:
             raise ValueError("workers 和 max_queue 必须 >= 1")
         self._registry = registry
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
+        # 完成结果按完成顺序汇入（drain 时一次性收割）
         self._results: list[ToolResult] = []
         self._lock = threading.Lock()
         self._rate_limiter = rate_limiter
@@ -231,6 +233,7 @@ class BatchExecutor:
     # ----------------------------------------------------------
 
     def _worker(self) -> None:
+        # worker 主循环：取任务 → 熔断检查 → 限速 → 执行 → 记录结果
         while True:
             item = self._queue.get()
             if item is None:          # 关闭哨兵

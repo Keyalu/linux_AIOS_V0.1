@@ -48,6 +48,7 @@ class SecuritySandbox:
             if p and p not in self.protected:
                 self.protected.append(p)
         return len(self.protected)
+        # ↓ 历史遗留：此行位于 return 之后不可达，为不改动代码仅加注说明
         self.signatures: dict[str, str] = {}     # 工具名 -> 源码 SHA-256
 
     # ---------------------------------------------------------- --
@@ -59,6 +60,7 @@ class SecuritySandbox:
         params = intent.get("params") or {}
         target = str(intent.get("target", ""))
         cmd = str(params.get("cmd", ""))
+        # 把动作/目标/命令/原话拼成一个检测面，四层检查都在它上面做
         blob = f"{action} {target} {cmd} {intent.get('user_text', '')}"
 
         # 第 1 层：权限检查（危险命令 / 受保护路径）
@@ -83,6 +85,7 @@ class SecuritySandbox:
 
         # 第 4 层：隐私保护 —— 判断本次意图参数里是否携带敏感信息
         leaked = [k for k, v in params.items() if _SENSITIVE_RE.search(str(v))]
+        # 通过全部拦截层后定级：low/medium 决定 GUI 提示强度
         risk = self._risk_of(action, params)
         reason = (f"通过四层检查（沙箱={'可用' if sandboxed else '不可用,以最小权限执行'}; "
                   f"签名核对 {len(self.signatures)} 项; 敏感字段 {leaked or '无'}）")
@@ -103,6 +106,7 @@ class SecuritySandbox:
             func = getattr(mod, name, None) if mod else None
             if func is None:
                 continue
+            # 重新计算当前源码摘要，与登记时不符即判定被篡改
             now = hashlib.sha256(inspect.getsource(func).encode()).hexdigest()
             if now != digest:
                 tampered.append(name)

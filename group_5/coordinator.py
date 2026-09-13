@@ -26,6 +26,7 @@ class SystemCoordinator:
                  schemas_catalog: dict | None = None,
                  default_target: str = ".",
                  artifact_dir: str | None = None):
+        # 模块登记表：组号 → 实例（组5 自身也注册进来）
         self.modules: dict[int, object] = {}
         self.register(1, host)                 # 组1 AI Shell + HostAgent
         self.register(2, planner)              # 组2 任务规划 + 控件检测
@@ -55,10 +56,15 @@ class SystemCoordinator:
         """
         bundle: dict = {"user_input": user_input}
 
-        # 步骤 1：组1 意图理解
+        # 步骤 1：组1 意图理解（RAG 召回相似历史轨迹作 few-shot 记忆注入）
+        memory = self._recall_memory(user_input)
         intent = self.modules[1].understand_intent(user_input,
-                                                   default_target=self.default_target)
+                                                   default_target=self.default_target,
+                                                   memory=memory)
         bundle["intent"] = intent
+        # LLM 失败降级规则时如实标注：规则引擎对长/复杂指令只是粗略解析
+        degraded = str(getattr(self.modules[1], "last_engine", "")).startswith("rules")
+        bundle["degraded"] = degraded
 
         # 步骤 2：组5 安全检查
         security = self.security or SecuritySandboxStub()
@@ -75,18 +81,12 @@ class SystemCoordinator:
             self._persist(bundle)
             return bundle
 
-        # 步骤 3：组2 任务规划（+ 控件检测）
+        # 步骤 3：组2 任务规划。plan["elements"] 只含步骤引用的元素
+        # （规划期预定位结果，通常 0~3 个）；全桌面快照走 /api/controls，
+        # 不再随 plan 全量携带（响应体积从几十 KB 降至 KB 级）
         plan = self.modules[2].plan(intent)
         bundle["plan"] = plan
-        if self.detector is not None:
-            try:
-                detected = self.detector.detect_elements()
-                elements = {el.get("name"): el for el in detected
-                            if isinstance(el, dict) and el.get("name")}
-                bundle["elements"] = elements
-                plan["elements"] = elements
-            except Exception:
-                bundle["elements"] = plan.get("elements", {})
+        bundle["elements"] = plan.get("elements", {})
 
         if not plan.get("steps"):
             bundle["rejected"] = "；".join(plan.get("unresolved", [])) or "无可执行步骤"
@@ -119,6 +119,7 @@ class SystemCoordinator:
         bundle: dict = {"intent": intent, "plan": plan}
 
         agent = self.modules[3]
+        # deny 模式临时替换提权确认回调，执行完在 finally 恢复
         old_confirmer = agent.confirmer
         if confirm_mode == "deny":
             agent.confirmer = lambda info: False
@@ -137,6 +138,7 @@ class SystemCoordinator:
         bundle["session"] = session
         bundle["results"] = session["steps"]
 
+        # 步骤 5：组5 审计对账（summary 与逐条结果一致才 PASS）+ RAG 入库
         ok = session["summary"]["success"]
         total = session["summary"]["total"]
         consistent = self._consistent(session)
@@ -171,9 +173,11 @@ class SystemCoordinator:
         t0 = time.monotonic()
         bundle: dict = {"ok": False, "user_text": user_input}
 
-        # 步骤 1：组1 意图理解
+        # 步骤 1：组1 意图理解（RAG 记忆注入）
+        memory = self._recall_memory(user_input)
         intent = self.modules[1].understand_intent(user_input,
-                                                   default_target=self.default_target)
+                                                   default_target=self.default_target,
+                                                   memory=memory)
         bundle["intent"] = intent
 
         # 步骤 2：组5 安全检查（任务书：组1 之后必须过安全闸门）
@@ -188,19 +192,10 @@ class SystemCoordinator:
             self._persist(bundle)
             return bundle
 
-        # 步骤 3：组2 任务规划（+ 控件检测）
+        # 步骤 3：组2 任务规划（elements 收敛同 plan_only，全桌面快照走 /api/controls）
         plan = self.modules[2].plan(intent)
         bundle["plan"] = plan
-        if self.detector is not None:
-            try:
-                detected = self.detector.detect_elements()
-                # 契约：plan["elements"] 是 {名称: 元素} 字典，供 GUI 步骤定位
-                elements = {el.get("name"): el for el in detected
-                            if isinstance(el, dict) and el.get("name")}
-                bundle["elements"] = elements
-                plan["elements"] = elements
-            except Exception:
-                bundle["elements"] = plan.get("elements", {})
+        bundle["elements"] = plan.get("elements", {})
 
         # 步骤 4：组3 执行（工具步骤内部经组4 公开契约调用）
         if not plan.get("steps"):
@@ -213,7 +208,44 @@ class SystemCoordinator:
         bundle["session"] = session
         bundle["results"] = session["steps"]
 
-        # 步骤 5：组5 审计 + RAG 入库
+        # 步骤 4.5：失败反思重试（智能体闭环）——LLM 产出修正 intent，重新过
+        # 安全闸门与决策表后自动重试一次（仅限一步式编排；GUI 确认流不变）
+        if (session["summary"].get("fail", 0) > 0
+                and getattr(self.modules[1], "use_llm", False)):
+            fixed = None
+            try:
+                failed = [{"step": s.get("step"), "name": s.get("name"),
+                           "params": s.get("params_sent", {}),
+                           "error": (s.get("tool_result") or {}).get("error", "")}
+                          for s in session["steps"]
+                          if not (s.get("tool_result") or {}).get("success", True)]
+                fixed = self.modules[1].repair_intent(
+                    user_input, failed, self.modules[3].tool_menu(), intent)
+            except Exception:
+                fixed = None
+            if fixed and fixed.get("goals"):
+                check2 = (self.security or SecuritySandboxStub()).check(fixed)
+                self.audit({"stage": "reflect", "approved": check2["approved"],
+                            "risk_level": check2.get("risk_level"),
+                            "intent": fixed})
+                plan2 = self.modules[2].plan(fixed) \
+                    if check2["approved"] else {}
+                if plan2.get("steps"):
+                    session = self.modules[3].execute_plan(plan2)
+                    intent, plan = fixed, plan2
+                    bundle["intent"] = intent
+                    bundle["plan"] = plan
+                    bundle["session"] = session
+                    bundle["results"] = session["steps"]
+                    bundle["reflected"] = {
+                        "reason": "首次执行存在失败步骤，已按 LLM 修复方案重试一次",
+                        "fixed_goals": fixed.get("goals")}
+                else:
+                    bundle["reflected"] = {
+                        "reason": "反思产出的修正计划未通过安全检查或为空",
+                        "rejected": not check2["approved"]}
+
+        # 步骤 5：组5 审计 + RAG 入库（检索增强扩展点）
         ok = session["summary"]["success"]
         total = session["summary"]["total"]
         consistent = self._consistent(session)
@@ -241,6 +273,17 @@ class SystemCoordinator:
         return bundle
 
     # ---------------------------------------------------------- --
+    # 记忆召回：相似历史轨迹 → 意图层 few-shot 注入（越用越懂用户）
+    # ---------------------------------------------------------- --
+    def _recall_memory(self, user_input: str) -> list | None:
+        if self.rag is None:
+            return None
+        try:
+            return self.rag.query(user_input, 2) or None
+        except Exception:
+            return None                  # 记忆召回失败不影响编排主流程
+
+    # ---------------------------------------------------------- --
     # 中间产物落盘（持久性：intent/plan/check/session/audit 五件套）
     # ---------------------------------------------------------- --
     def _persist(self, bundle: dict) -> None:
@@ -258,6 +301,7 @@ class SystemCoordinator:
     # 审计日志（持久性：JSONL 逐条追加）
     # ---------------------------------------------------------- --
     def audit(self, record: dict) -> None:
+        # JSONL 追加：一行一条审计事件（重启不丢）
         rec = {"time": datetime.now().isoformat(), **record}
         self.audit_records.append(rec)
         if not self.audit_path:

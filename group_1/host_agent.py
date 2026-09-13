@@ -21,6 +21,8 @@ import time
 import urllib.request
 import uuid
 
+from src import llm_client   # 修复/生成类 LLM 调用共用同一配置源（便于测试替身）
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------- --
@@ -36,13 +38,21 @@ _CATEGORIES = {
     "send_email": "应用控制",
     "navigate": "应用控制", "switch_window": "应用控制", "create_folder": "应用控制",
     "weather": "信息查询", "search": "信息查询", "translate": "信息查询",
+    "web_search": "信息查询", "web_open": "应用控制", "web_click": "应用控制",
+    "web_state": "信息查询", "web_extract": "信息查询", "answer": "信息查询",
+    "web_close_browser": "应用控制",
 }
 
 # (正则, 动作, 描述) —— 顺序即优先级，靠前的更具体
 _RULES: list[tuple[str, str, str]] = [
     (r"天气", "weather", "查询城市天气"),
     (r"翻译", "translate", "翻译文本"),
-    (r"联网搜索|上网查|搜个|搜一下", "search", "联网搜索资料"),
+    (r"联网搜索|上网查|搜个|搜一下|搜索(?!文件)", "web_search",
+     "浏览器打开搜索结果页（数据链走 mcp_search）"),
+    (r"网页(的)?内容|页面(的)?内容", "web_extract", "抽取当前网页内容"),
+    (r"关闭(自动化)?浏览器|退出(自动化)?浏览器", "web_close_browser", "优雅关闭自动化浏览器"),
+    (r"告诉我|说说|介绍一下", "answer", "回答问题（LLM 解读数据）"),
+    (r"总结|概括", "answer", "总结上一步结果（LLM）"),
     (r"整理|归类|分类", "organize", "把目录里的文件按类型分类到子文件夹"),
     (r"重复|查重|冗余", "find_duplicates", "找出内容重复的文件"),
     (r"备份|备个份", "backup", "把目标目录压缩备份"),
@@ -52,12 +62,15 @@ _RULES: list[tuple[str, str, str]] = [
     (r"清理|清空", "cleanup_temp", "清理临时文件"),
     (r"删除|删掉", "delete_file", "删除文件或目录"),
     (r"发(一封)?邮件|发送邮件", "send_email", "发送电子邮件"),
+    (r"(发给|发送给|发到)\S*@\S+", "send_email", "把文件/内容发送给指定邮箱"),
     (r"打开(网址|网页)|访问", "open_url", "打开网页"),
     (r"导航|前往|去到", "navigate", "在文件管理器中导航到路径"),
     (r"切换到|切换窗口|切到", "switch_window", "切换应用窗口"),
     (r"创建|新建", "create_folder", "创建文件夹"),
     (r"点击(?:网页|页面|浏览器)|(?:网页|页面|浏览器)(?:里|中|上)(?:的)?点击",
      "web_click", "在网页中点击元素（自动化浏览器）"),
+    (r"打开(文件)?(路径|目录)|打开文件夹", "navigate",
+     "在文件管理器中打开该路径（先开文件管理器再跳转）"),
     (r"点击|点一下|单击|双击", "click_element", "点击界面控件（按名称/角色定位）"),
     (r"打开|启动|运行", "open_app", "打开应用"),
     (r"找(?!到)|查找", "find_files", "按条件搜索文件"),
@@ -69,20 +82,22 @@ _QUOTE_RE = re.compile(r"[「'\"]([^」'\"]+)[」'\"]")
 
 def _match_goals(text: str) -> list[dict]:
     """按词典扫描多个动作；span 重叠时保留更具体的先命中项。"""
-    goals: list[dict] = []
+    hits: list[tuple[int, dict]] = []
     claimed: list[tuple[int, int]] = []
     for pattern, action, desc in _RULES:
         m = re.search(pattern, text)
         if not m:
             continue
-        if any(s <= m.start() and m.end() <= e for s, e in claimed):
+        if any(st <= m.start() and m.end() <= en for st, en in claimed):
             continue                      # 命中位置被更具体的动作覆盖
         claimed.append((m.start(), m.end()))
-        goals.append({"action": action, "description": desc})
+        hits.append((m.start(), {"action": action, "description": desc}))
     # 通用"找"只是兜底：已有更具体的文件目标时丢弃
-    if len(goals) > 1 and any(g["action"] == "find_files" for g in goals):
-        goals = [g for g in goals if g["action"] != "find_files"] or goals
-    return goals
+    if len(hits) > 1 and any(g["action"] == "find_files" for _, g in hits):
+        hits = [h for h in hits if h[1]["action"] != "find_files"] or hits
+    # 目标按"话语中出现位置"排序 —— 用户说"先A再B再C"，计划就按 A→B→C
+    # 排，而不是按规则表顺序（长指令曾因此步骤顺序全乱）
+    return [g for _, g in sorted(hits, key=lambda x: x[0])]
 
 
 def _extract_params(action: str, text: str) -> dict:
@@ -91,8 +106,9 @@ def _extract_params(action: str, text: str) -> dict:
     if action == "weather":
         m = re.search(r"(?:查询|查|看看|看|一下|帮我)*(.*?)天气", text)
         params["city"] = (m.group(1) if m else "").strip(" 的「」，,。") or "北京"
-    elif action == "search":
-        params["query"] = re.sub(r"^(帮我|请|麻烦)?(联网搜索|上网查|搜个|搜一下)", "", text).strip(" ，。,") or text
+    elif action in ("search", "web_search"):
+        params["query"] = re.sub(r"^(帮我|请|麻烦)?(联网搜索|上网查|搜个|搜一下|搜索)",
+                                 "", text).strip(" ，。,「」\"'") or text
     elif action == "translate":
         params["text"] = re.sub(r".*?(?:把|将)?(.*?)(?:翻译.*)?$", r"\1", text).strip(" 「」") or text
         params["to_lang"] = "en"
@@ -143,6 +159,13 @@ def _extract_params(action: str, text: str) -> dict:
             rest = re.sub(r"[，。、；:：]+$", "", rest).strip()
             if rest:
                 params["text"] = rest
+    elif action == "answer":
+        # 问题文本：去掉触发词后的剩余；纯"总结一下"则问题留空（纯总结模式）
+        m = re.search(r"(告诉我|说说|介绍一下|总结|概括)(一下)?", text)
+        if m:
+            rest = text[m.end():].strip(" 的「」，,。：:。")
+            if rest:
+                params["question"] = rest
     elif action == "navigate":
         u = re.search(r"[「'\"]?(/[/\w.\-~]+)[「'\"]?", text)
         params["path"] = u.group(1) if u else "~/Documents"
@@ -230,19 +253,34 @@ class HostAgent:
     # ---------------------------------------------------------- --
     # 对外唯一入口
     # ---------------------------------------------------------- --
-    def understand_intent(self, user_input: str, default_target: str = ".") -> dict:
+    def understand_intent(self, user_input: str, default_target: str = ".",
+                          memory: list | None = None) -> dict:
+        """意图理解入口。memory：RAG 召回的相似历史轨迹（few-shot 注入）。"""
         user_input = (user_input or "").strip()
         intent = None
         if self.use_llm:
             try:
-                intent = self._llm_intent(user_input)
+                intent = self._llm_intent(user_input, memory=memory)
                 self.last_engine = f"llm:{self.model}"
             except Exception:
-                intent = None                  # 网络/密钥/解析失败 → 降级
+                time.sleep(2)
+                try:                           # 瞬时限流/抖动重试一次
+                    intent = self._llm_intent(user_input, memory=memory)
+                    self.last_engine = f"llm:{self.model}"
+                except Exception:
+                    intent = None              # 仍失败 → 降级规则
         if intent is None:
             intent = self._rule_intent(user_input)
             self.last_engine = "rules"
-        intent.setdefault("target", default_target)
+        return self._finalize_intent(intent, user_input, default_target)
+
+    def _finalize_intent(self, intent: dict, user_input: str,
+                          default_target: str) -> dict:
+        """意图归一尾段（确定性归一，红线 3 的主战场）：target 解析 /
+        dry_run / 附件 / dest 等。understand_intent 与 repair_intent
+        共用，保证反思修复产出的 intent 与原始意图同一口径。"""
+        if not intent.get("target"):         # setdefault 对"键存在值为空"无效
+            intent["target"] = default_target
         if not intent.get("target_label"):
             intent["target_label"] = intent.get("target", "")
         # 宿主环境解析：文件类意图的目标称呼（「demo_task」等）映射为真实目录
@@ -262,19 +300,6 @@ class HostAgent:
                 g.setdefault("params", {})["dry_run"] = draft_only
         if intent.get("action") == "send_email":
             intent.setdefault("params", {})["dry_run"] = draft_only
-
-        # send_email 附件确定性归一：话语里出现的真实文件路径 → attachment
-        m_file = re.search(
-            r"(/[\w.\-\u4e00-\u9fa5]+)+[/\w.\-\u4e00-\u9fa5]*\."
-            r"(md|txt|pdf|docx|csv|json|py|log|xlsx|png|jpg)",
-            user_input)
-        for g in intent.get("goals", []):
-            if (g.get("action") == "send_email" and m_file
-                    and not (g.get("params") or {}).get("attachment")):
-                g.setdefault("params", {})["attachment"] = m_file.group(0)
-        if (intent.get("action") == "send_email" and m_file
-                and not (intent.get("params") or {}).get("attachment")):
-            intent.setdefault("params", {})["attachment"] = m_file.group(0)
 
         # send_email 多目标合并：LLM 偶尔把"多文件发给同一人"拆成多条——
         # 合并为一条，附件收进列表（send_email 已支持数组多附件）
@@ -300,33 +325,142 @@ class HostAgent:
                 g for g in intent.get("goals", [])
                 if not (g.get("action") == "send_email" and g is not first)]
 
-        # 文件类动作的 goal.params 路径参数同样做宿主环境解析
+        # 文件类动作（含截图/写入）的路径统一归一到默认工作区：
+        # - 缺路径的目录级动作 → 工作区（工具内置默认如 ~/Downloads 可能不存在）
+        # - '.'/'..' 与 shell 风格 $变量占位 → 丢弃/映射工作区
+        # - 相对路径/裸文件名（hnu_intro.md）→ 工作区内
+        # - 不存在的绝对路径（LLM 编造的 /data/out/…）→ 工作区 + 文件名
+        # - 已存在的绝对路径 → 保留（用户明确指定的真实位置）
+        # - 目录级动作工作区外且话语无迹可循 → 工作区（证据防线）
         for g in intent.get("goals", []):
-            if g.get("action") not in self._FILE_ACTIONS:
+            action = g.get("action")
+            if action not in self._FILE_ACTIONS and action != "take_screenshot":
                 continue
+            is_dir_scope = action in self._DIR_SCOPE_ACTIONS
             for k in ("path", "src", "directory"):
                 v = (g.get("params") or {}).get(k)
-                if not v:
+                if v in (None, ""):
+                    if is_dir_scope:
+                        g.setdefault("params", {})[k] = default_target
+                    continue                              # 缺路径 → 工作区
+                v = str(v).strip()
+                if re.fullmatch(r"\$\{?\w+\}?", v):
+                    g["params"].pop(k, None)              # 变量占位 → 兜底填充
                     continue
-                # 目录级动作（整理/查重/备份/清临时/找大文件）的作用域是
-                # 工作区，'.'/'..' 一律映射到 default_target —— 曾因规则
-                # 引擎把 path='.' 原样放行，organize 把整个项目根分类移动
-                # （实战事故：main.py/README.md 被移进 代码//文档/）
-                if v in (".", "./", "..", "../") \
-                        and g.get("action") in self._DIR_SCOPE_ACTIONS:
+                if v in (".", "./", "..", "../") and is_dir_scope:
                     g["params"][k] = default_target
                     continue
-                r = self._resolve_target(v, default_target)
-                if r != v:
-                    g["params"][k] = r
+                v = os.path.expanduser(v)
+                if os.path.isabs(v) and os.path.exists(v):
+                    r = v                                 # 真实位置 → 保留
+                elif os.path.isabs(v):
+                    # 不存在的绝对路径：父目录真实 → 合法的计划输出文件，保留；
+                    # 父目录也不存在（幻觉前缀如 /data/out）→ 工作区 + 文件名
+                    parent = os.path.dirname(v.rstrip("/\\"))
+                    r = v if os.path.isdir(parent) else os.path.join(
+                        default_target, os.path.basename(v.rstrip("/\\")))
+                else:
+                    r = os.path.join(default_target, v)   # 相对 → 工作区内
+                # 目录级动作的目标必须真实存在（organize 不建根目录）——
+                # "整理 工作区文件夹"被拼成不存在的工作区/工作区 → 回落根目录
+                if is_dir_scope and r != default_target \
+                        and not os.path.isdir(r):
+                    r = default_target
+                if (is_dir_scope and r != default_target
+                        and not r.startswith(default_target.rstrip("/") + "/")
+                        and os.path.basename(r.rstrip("/\\"))
+                        not in (user_input or "")):
+                    r = default_target                    # 证据防线
+                g["params"][k] = r
             d = (g.get("params") or {}).get("dest")
+            if d and re.fullmatch(r"\$\{?\w+\}?", str(d).strip()):
+                g["params"].pop("dest", None)     # 变量占位 → 组2 重派生
+                d = None
             if d:
                 src_v = (g.get("params") or {}).get("src") or default_target
                 nd = self._normalize_dest(d, default_target, src_v)
+                if nd is not None:
+                    # LLM 幻觉目的地的最后防线：工作区外的绝对 dest 只有在
+                    # 用户话语里有迹可循（父目录名/文件名被用户提及）才接受，
+                    # 否则一律锚回工作区 —— 曾致备份 zip 落到桌面致测试失败
+                    nd_parent = os.path.basename(os.path.dirname(nd.rstrip("/\\")))
+                    nd_tail = os.path.basename(nd.rstrip("/\\"))
+                    if not (nd_parent in (user_input or "")
+                            or nd_tail in (user_input or "")):
+                        nd = os.path.join(os.path.dirname(default_target),
+                                          os.path.basename(nd.rstrip("/\\")))
                 if nd is None:
                     g["params"].pop("dest", None)   # 幻觉路径 → 组2 重派生
                 else:
                     g["params"]["dest"] = nd
+
+        # send_email 附件确定性归一（在路径归一之后执行，三级来源）：
+        # 1) 话语里出现的真实文件路径；2) 计划内其他目标将产出的文件
+        # （截图路径/写入的报告/备份 zip）；3) LLM 给的真实存在路径。
+        # 占位符（{{prev_result}}/$var）与不存在的路径一律丢弃 ——
+        # 附件在执行期由 send_email 自行校验，缺文件时如实报错
+        def _planned_files() -> list:
+            files = []
+            for g in intent.get("goals", []):
+                gp = g.get("params") or {}
+                if g.get("action") in ("take_screenshot", "write_file") \
+                        and gp.get("path"):
+                    files.append(str(gp["path"]))
+                if g.get("action") in ("backup", "backup_directory"):
+                    # 镜像组2 的派生口径：src → dest=src_backup → zip
+                    d = str(gp.get("dest") or "").strip()
+                    src = str(gp.get("src") or "").strip() or default_target
+                    base = d or src.rstrip("/\\") + "_backup"
+                    if not os.path.isabs(base):
+                        base = os.path.join(os.path.dirname(default_target), base)
+                    files.append(base.rstrip("/\\") + ".zip")
+            return files
+
+        planned = _planned_files()
+        m_file = re.search(
+            r"(/[\w.\-\u4e00-\u9fa5]+)+[/\w.\-\u4e00-\u9fa5]*\."
+            r"(md|txt|pdf|docx|csv|json|py|log|xlsx|png|jpg)",
+            user_input)
+        # 1) 计划内产物优先（截图/报告/备份 zip —— 执行期依序产生）；
+        # 2) LLM/话语给的额外真实文件按绝对路径补充，与计划产物同名者去重
+        #    （裸文件名是进程 CWD 旧副本，会被计划产物的绝对路径取代）
+        wanted: list = []
+        seen_base: set = set()
+        for f in planned:
+            if f not in wanted:
+                wanted.append(f)
+                seen_base.add(os.path.basename(f))
+        extra: list = []
+        for g in intent.get("goals", []):
+            if g.get("action") != "send_email":
+                continue
+            att = (g.get("params") or {}).get("attachment")
+            for a in (att if isinstance(att, (list, tuple))
+                      else ([att] if att else [])):
+                extra.append(str(a).strip())
+        if m_file:
+            extra.append(m_file.group(0))
+        for a in extra:
+            if not a or "{{" in a or re.fullmatch(r"\$\{?\w+\}?", a):
+                continue
+            a_abs = os.path.abspath(os.path.expanduser(a))
+            if os.path.isfile(a_abs) \
+                    and os.path.basename(a_abs) not in seen_base:
+                wanted.append(a_abs)
+                seen_base.add(os.path.basename(a_abs))
+        for g in intent.get("goals", []):
+            if g.get("action") == "send_email":
+                if wanted:
+                    g.setdefault("params", {})["attachment"] = \
+                        wanted[0] if len(wanted) == 1 else list(wanted)
+                else:
+                    g["params"].pop("attachment", None)   # 占位符全灭 → 不附
+        if intent.get("action") == "send_email":
+            if wanted:
+                intent.setdefault("params", {})["attachment"] = \
+                    wanted[0] if len(wanted) == 1 else list(wanted)
+            else:
+                intent["params"].pop("attachment", None)
 
         intent["user_text"] = user_input
         intent["intent_id"] = f"intent-{uuid.uuid4().hex[:8]}"
@@ -335,10 +469,72 @@ class HostAgent:
         return intent
 
     _FILE_ACTIONS = {"organize", "find_duplicates", "backup", "find_large_files",
-                     "find_files", "cleanup_temp", "delete_file"}
+                     "find_files", "cleanup_temp", "delete_file",
+                     "organize_downloads", "find_duplicate_files",
+                     "backup_directory", "write_file", "take_screenshot"}
     # 作用域为整个目录的动作：'.'/'..' 必须映射到工作区，禁止落到进程 CWD
     _DIR_SCOPE_ACTIONS = {"organize", "find_duplicates", "backup",
-                          "find_large_files", "cleanup_temp"}
+                          "find_large_files", "cleanup_temp",
+                          "organize_downloads", "find_duplicate_files",
+                          "backup_directory"}
+
+    def detect_operation(self, user_input: str) -> dict | None:
+        """对话路由检测：规则引擎识别系统操作意图（确定性、零 token）。
+
+        命中返回 intent（调用方交编排管线，须走确认流），未命中返回
+        None（走纯对话）。answer 归对话本身的能力，不参与路由——
+        避免日常聊天频繁弹出执行卡片。"""
+        # 保守门：规则引擎只够格解析"短而单一"的操作指令。长/复杂文本
+        # 会被关键词搅成垃圾计划（实战：9 目标长指令被解析成 query=全文）
+        if len(user_input.strip()) > 60:
+            return None
+        intent = self._rule_intent(user_input)
+        goals = [g for g in intent.get("goals", [])
+                 if g.get("action") != "answer"]
+        if not goals or len(goals) > 2:
+            return None
+        intent["goals"] = goals
+        intent["action"] = goals[0]["action"]
+        intent["user_text"] = user_input
+        return intent
+
+    def repair_intent(self, user_input: str, failed_steps: list[dict],
+                      tool_menu: list[str],
+                      original_intent: dict | None = None) -> dict | None:
+        """失败反思（智能体闭环）：把失败步骤喂给 LLM 产出修正 goals。
+
+        返回的 intent 与原始计划同等不可信——调用方必须重新过安全闸门、
+        决策表与 schema 校验后再执行。无法修复（LLM 不可用/输出空计划）
+        返回 None，调用方保持首次结果。"""
+        if not (failed_steps and tool_menu):
+            return None
+        prompt = (
+            "用户的任务计划里有步骤执行失败。请参考可用工具清单，输出修正后的计划。\n"
+            '只输出 JSON：{"goals":[{"action":"..","target":"..","params":{..}}]}\n'
+            "可以换工具、改参数、换路径；确实无法修复时输出 {\"goals\":[]}\n\n"
+            f"原始指令: {user_input}\n"
+            f"失败步骤: {json.dumps(failed_steps, ensure_ascii=False)}\n"
+            f"可用工具: {', '.join(tool_menu)}"
+        )
+        raw = llm_client.chat(prompt, timeout=45, max_input_chars=5000)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        goals = [g for g in (parsed.get("goals") or []) if g.get("action")]
+        if not goals:
+            return None
+        intent = {"intent": "修复重试", "action": goals[0]["action"],
+                  "target": (original_intent or {}).get("target", ""),
+                  "params": goals[0].get("params", {}),
+                  "confidence": 0.5, "user_text": user_input,
+                  "goals": goals}
+        # 与 understand_intent 共用归一尾段（dest/dry_run/附件/路径全口径）
+        return self._finalize_intent(
+            intent, user_input,
+            (original_intent or {}).get("target", "."))
 
     @staticmethod
     def _normalize_dest(dest: str, default_target: str, src: str) -> str | None:
@@ -380,55 +576,58 @@ class HostAgent:
     # ---------------------------------------------------------- --
     _SYSTEM_PROMPT = (
         "你是 Linux Agentic OS 的意图理解模块。把用户指令解析成 JSON，只输出 JSON 不要解释。\n"
-        "指令可能包含多个动作（如：搜索XX并把结果写入文件）——每个动作一个 goal，按执行顺序排列。格式：\n"
-        '{"intent":"类别","target":"","confidence":0.9,"goals":[{"action":"..","target":"..","params":{..}}]}\n'
+        '格式：{"intent":"类别","target":"","confidence":0.9,"goals":'
+        '[{"action":"..","target":"..","params":{..}}]}，多动作按执行顺序排列。\n'
         "可用 action：organize/find_duplicates/backup/find_large_files/find_files/"
         "cleanup_temp/delete_file/disk_usage/system_check/open_url/open_app/"
         "send_email/weather/search/translate/write_file/run_command/"
         "navigate/create_folder/switch_window/take_screenshot/click_element/"
-        "web_open/web_click/web_state\n"
-        "截图链路：截图保存类需求 → take_screenshot(path=显式路径，"
-        "如 /home/keyal/桌面/111/Agent_OS_v1.0/out/截图.png)；"
-        "随后 send_email(attachment=同路径)/write_file 引用同一文件\n"
-        "桌面 GUI 场景优先用：打开/启动应用=open_app(app)；"
-        "点击界面控件（任务栏图标/按钮/label）=click_element(name=控件显示名,"
-        " role=可选控件角色如 label/push button/icon)；"
-        "导航到路径=navigate(path)；"
-        "创建文件夹=create_folder(name)；切换窗口=switch_window(app)；"
-        "截屏=take_screenshot(path)\n"
-        "网页操作（自动化浏览器）：打开网页=web_open(url)，之后要在页面里"
-        "点击/操作 → web_click(text=元素可见文本子串)；读当前页 URL/标题="
-        "web_state()。带后续点击的网页任务必须用 web_open 而非 open_url\n"
-        "浏览器边界：open_url 仅用系统默认浏览器打开网址（无法继续点击）；"
-        "网页内容不在桌面控件树里 —— 不要用 click_element 点网页元素，"
-        "一律走 web_click；需要搜索结果的内容/链接时用 search(query)\n"
-        "常用参数名：write_file 用 path(含文件名的完整路径)+content，写报告/摘录用它；"
-        "run_command 用 cmd；open_url 用 url；"
-        "send_email 用 to,subject,body,attachment(把文件发给对方时给文件的完整路径),"
-        "dry_run(用户明确要求发送=false，仅起草/预览=true)；"
-        "示例:把/out/a.md发送给x@qq.com → {action:send_email,params:{to:x@qq.com,"
-        "subject:a.md,attachment:/out/a.md,dry_run:false}}\n"
-        "mcp_weather 用 city,days；mcp_search 用 query；mcp_translate 用 text,to_lang；"
-        "文件技能：organize_downloads(path)/find_duplicate_files(path)/"
-        "backup_directory(src,dest)/find_large_files(path,min_size_mb)\n"
-        "数据依赖：后一步参数需要前一步输出时，该参数值写占位符 {{prev_result}}"
-        "（表示上一步的结果文本）。示例：\n"
-        '输入:搜索智能体并摘录写入 /data/out/a.md → {"intent":"信息查询","goals":['
-        '{"action":"search","target":"","params":{"query":"智能体"}},'
-        '{"action":"write_file","target":"/data/out/a.md","params":{'
-        '"path":"/data/out/a.md","content":"{{prev_result}"}}]}\n'
-        "点击控件示例：输入:点击label，文件（点击任务栏里名字为“文件”的控件）"
-        ' → {"intent":"应用控制","goals":[{"action":"click_element","target":"文件",'
-        '"params":{"name":"文件","role":"label"}}]}\n'
-        "intent 类别取第一个动作所属：文件操作/应用控制/系统设置/信息查询。"
+        "web_search/web_open/web_click/web_state/web_extract/llm_answer/"
+        "web_close_browser\n"
+        "工具参数：write_file(path,content) run_command(cmd[,timeout]) open_url(url) "
+        "open_app(app) send_email(to,subject,body,attachment[文件路径],"
+        "dry_run[用户明确要发=false]) take_screenshot([path]) mcp_weather(city[,days]) "
+        "mcp_search(query) mcp_translate(text,to_lang) web_search(query[,engine]) "
+        "web_open(url) web_click(text) web_state() web_extract() "
+        "llm_answer([question,text]) click_element(name[,role])\n"
+        "桌面 GUI：打开/启动应用=open_app(app)；点击界面控件=click_element(name[,role])；"
+        "打开/跳转到某个文件路径或目录=navigate(path)（先打开文件管理器再跳转，不要用 run_command）；"
+        "导航=navigate(path)；创建文件夹=create_folder(name)；切换窗口=switch_window(app)；"
+        "截屏=take_screenshot(path，随后的 send_email/write_file 引用同一路径)\n"
+        "网页与搜索：看搜索结果页/后续要点击=web_search(query)；"
+        "要数据(写文件/回答)=mcp_search(query)；"
+        "点击第N条搜索结果=web_search(query)后接 web_click(nth=N)；"
+        "点击页面上指定文字的元素=web_click(text)；"
+        "打开具体网址=web_open(url)或open_url(url)；"
+        "读当前页面内容=web_extract()；回答问题/总结=llm_answer(question[,text])；"
+        "关闭自动化浏览器=web_close_browser()（不要用 run_command 跑 pkill）\n"
+        "边界：网页内容不在桌面控件树里，不要用 click_element 点网页元素\n"
+        "数据依赖：后一步参数需要前一步输出时写占位符 {{prev_result}}\n"
+        "示例1:搜索智能体并摘录写入 a.md → goals:[{action:mcp_search,"
+        "params:{query:智能体}},{action:write_file,params:{path:a.md,"
+        "content:{{prev_result}}}}]（裸文件名自动存入工作区）\n"
+        "示例2:点击label，文件 → goals:[{action:click_element,"
+        "params:{name:文件,role:label}}]\n"
+        "intent 类别：文件操作/应用控制/系统设置/信息查询，取第一个动作所属\n"
     )
 
-    def _llm_intent(self, text: str) -> dict | None:
+    def _llm_intent(self, text: str, memory: list | None = None) -> dict | None:
         if not text:
             return None
+        system = self._SYSTEM_PROMPT
+        if memory:
+            # RAG 记忆注入：相似历史轨迹作 few-shot 参考（动作选择借鉴，
+            # 参数不照抄）——用户的通道偏好与纠正由此沉淀生效
+            refs = "\n".join(
+                f"- 输入:{(m.get('input') or '')[:60]} → "
+                f"动作:{m.get('actions')}（{(m.get('result') or '')[:40]}）"
+                for m in memory[:2])
+            system += ("\n相似历史任务的处理记录（供参考动作选择，不要照抄参数）:\n"
+                       + refs)
+        # OpenAI 兼容 chat/completions 请求体（urllib 直连，零 SDK 依赖）
         body = json.dumps({
             "model": self.model,
-            "messages": [{"role": "system", "content": self._SYSTEM_PROMPT},
+            "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": text}],
             "temperature": getattr(self, "temperature", 0),
         }).encode()
@@ -436,9 +635,12 @@ class HostAgent:
             f"{self.base_url}/chat/completions", data=body,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.api_key}"})
-        with urllib.request.urlopen(req, timeout=60) as resp:   # 复杂多步指令生成较慢
+        # 复杂多目标指令的 JSON 生成实测可超 60s（自由档模型 ~68s），
+        # 超时会整体降级规则引擎 → 长指令被搅成垃圾计划
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
         content = data["choices"][0]["message"]["content"].strip()
+        # 剥掉 LLM 可能包裹的 markdown 代码栏再解析
         content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
         parsed = json.loads(content)
         goals = parsed.get("goals")
@@ -448,9 +650,11 @@ class HostAgent:
             goals = [{"action": parsed["action"],
                       "target": parsed.get("target", ""),
                       "params": parsed.get("params", {})}]
+        # 丢弃没有动作的空 goal
         goals = [g for g in goals if g.get("action")]
         if not goals:
             return None
+        # intent/action/params 取第一个 goal（主目标），全量 goals 原样带出
         primary = goals[0]
         return {"intent": parsed.get("intent")
                 or _CATEGORIES.get(primary["action"], "文件操作"),

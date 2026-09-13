@@ -68,3 +68,38 @@
 5. 测试：WS 帧回路（本地假服务器，见 TestWebAutomation）、Mock 降级（改
    `AIOS_WEB_BROWSER` 环境变量后必须恢复+复位 `_AUTO` 单例）、真机集成
    （skipUnless 有浏览器）。
+
+## 配方 7：加语义近邻工具（必须同步通道路由决策表）
+
+凡是与现有工具"用户目标相同、执行通道不同"的工具（如 mcp_search 拿数据 vs
+web_search 开结果页、open_url vs web_open）：
+
+1. `group_2/route_policy.py`：把动作加进对应歧义组（或新建组），决策表只写
+   **机械可判定**的判据——计划图消费分析（`{{prev_result}}/{{stepN}}` 引用）、
+   参数形态（像不像 URL）、后续步骤家族（有没有 web_click/web_state）。
+   不要把判据写成提示词散文——散文不可测试、组合爆炸。
+2. 改写自动带步骤级 `route_reason` + `plan["routes"]` 汇总（审计可见）；
+   目标动作缺必需参数时护栏拒绝改写（宁缺毋滥）。
+3. 提示词只教"语义区分"（什么词该给什么工具）+ 一个正例，通道兜底交给决策表
+   ——两头都要有，但提示词不再是唯一防线。
+4. 测试：决策表每个分支一组用例（见 TestRoutePolicy），必含缺参拒绝分支；
+   `{{prev_result}}` 占位符的正则兼容残缺形态 `{{prev_result}`（提示词示例
+   曾长期带此错，LLM 会照抄）。
+
+## 配方 8：智能化扩展（回答/记忆/反思）
+
+三个智能能力的实现模式与扩展点：
+
+1. **LLM 解读回答**（llm_answer + web_extract）：`src/llm_client.py` 是组内
+   通用文本 LLM 客户端（读 system_out/llm_config.json，零 SDK）。凡是
+   "工具输出 → 自然语言结论"的需求都做成 llm_answer 的变体；测试用
+   `llm.chat = fake` 替身。
+2. **RAG 记忆注入**：`coordinator._recall_memory` 召回 top-2 相似轨迹 →
+   `understand_intent(memory=...)` → `_llm_intent` 拼 few-shot。规则路径
+   不注入（确定性输出无需记忆）。纠正记忆若要落地：记
+   (话语, 错误动作, 纠正动作) 三元组进同一 JSONL 即可复用检索。
+3. **失败反思重试**：`HostAgent.repair_intent`（LLM 产出修正 goals）+
+   `orchestrate` 步骤 4.5（fail>0 且 LLM 可用时触发一次）。**铁律**：反思
+   产出的 intent 与原始计划同等不可信，必须重新过安全闸门 + 决策表 +
+   schema 校验；修不出有效方案就如实保留首次结果并标注 reflected。
+   GUI 确认流的反思需走 needs_confirm 二次确认，勿绕过。

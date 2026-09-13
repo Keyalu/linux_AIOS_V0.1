@@ -70,6 +70,7 @@ def _real_search(query: str) -> str | None:
     blocks = re.findall(
         r'<h3[^>]*class="[^"]*vr-?title[^"]*"[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
         html, re.S | re.I)
+        # 逐条剥掉 HTML 标签并去重，最多取前 5 条
     lines = []
     for u, t in blocks:
         title = re.sub(r"<[^>]+>|<!--.*?-->", "", t).strip()
@@ -141,6 +142,7 @@ class MCPConnector:
         self._setup_mock_weather(registry)
         self._setup_mock_translate(registry)
 
+        # 在服务器清单里登记一个 Mock Server（GUI 连接管理页可见）
         server_id = "mock-server"
         self.servers[server_id] = {
             "name": server_id,
@@ -231,6 +233,7 @@ class MCPConnector:
         -32603  Internal error    —— 工具执行失败
         """
         params = params or {}
+        # 用时间哈希造一个伪请求 id（JSON-RPC 响应需回带 id）
         req_id = abs(hash(datetime.now().isoformat())) % 100000
         result = registry.call(name, params)
         if result.success:

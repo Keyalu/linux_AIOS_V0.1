@@ -176,8 +176,15 @@ class AppAgent:
 
     @staticmethod
     def _resolve_refs(params: dict, ctx: dict) -> dict:
-        """把参数里的 {{prev_result}} / {{stepN.result}} 占位回填为真实结果。"""
+        """把参数里的 {{prev_result}} / {{stepN.result}} 占位回填为真实结果。
+
+        正则兼容单闭括号残缺形态 {{prev_result}——提示词示例曾长期带此错，
+        LLM 照样输出，严格匹配会静默不替换。"""
         def sub(value):
+            if isinstance(value, list):          # 附件列表等也要递归替换
+                return [sub(v) for v in value]
+            if isinstance(value, dict):
+                return {k: sub(v) for k, v in value.items()}
             if not isinstance(value, str) or "{{" not in value:
                 return value
 
@@ -189,7 +196,7 @@ class AppAgent:
                 if m2:
                     return ctx.get(int(m2.group(1)), "(引用的步骤不存在)")
                 return m.group(0)
-            return re.sub(r"\{\{([^}]+)\}\}", rep, value)
+            return re.sub(r"\{\{([^{}]+?)\}?\}", rep, value)
         return {k: sub(v) for k, v in params.items()}
 
     def _selfheal_name(self, wrong: str) -> str | None:

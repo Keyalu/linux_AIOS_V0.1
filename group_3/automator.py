@@ -64,6 +64,7 @@ class Automator:
             "click": self.click, "type": self.type_text,
             "hotkey": self.hotkey, "drag": self.drag,
             "open_app": self.open_app, "navigate": self.navigate,
+            "wait": self.wait,
         }.get(action)
         if handler is None:
             after = self.capture_state()
@@ -143,8 +144,15 @@ class Automator:
 
     def type_text(self, step, element_info, params):
         text = params.get("text", "")
-        # 1) 焦点对象的 Text 接口（若能定位到可编辑对象）
         if self.atspi:
+            # 1) 纯 ASCII（路径/命令等）优先合成按键：打进"当前聚焦"的
+            #    输入框（如 Ctrl+L 聚焦的地址栏）——语义正确的目标；
+            #    set_text 任意 text 角色对象会把路径写进不相干控件
+            if text and all(ord(c) < 128 for c in text):
+                self.atspi.type_text(text)
+                return {"message": f"合成键入 {text!r}", "synth": True}
+            # 2) 非 ASCII（中文文件名等，keysym 合成不可靠）→ 焦点对象的
+            #    Text 接口直接写内容
             acc = self.atspi.find_accessible(role="text")
             if acc is not None:
                 try:
@@ -153,9 +161,10 @@ class Automator:
                                 "api_action": True}
                 except Exception:
                     pass
-            # 2) 合成键盘输入（KEY_STRING 整串 → 逐键 keysym）
+            # 3) 兜底：仍尝试合成（非 ASCII 部分可能丢失，如实注明）
             self.atspi.type_text(text)
-            return {"message": f"合成键入 {text!r}", "synth": True}
+            return {"message": f"合成键入 {text!r}（非 ASCII 可能不完整）",
+                    "synth": True}
         if _REAL:
             import pyautogui
             pyautogui.typewrite(text)
@@ -214,7 +223,9 @@ class Automator:
     def open_app(self, step, element_info, params):
         """打开应用：优先 gtk-launch（走 .desktop，X11/Wayland 通用，
         检查返回码），失败则直接执行二进制；都不可用则 Mock 记录。"""
-        app = step.get("target") or params.get("app", "")
+        # params.app 优先：navigate 链里步骤的 target 是"要打开的路径"，
+        # 若用它当应用名，gtk-launch 必然失败 → 假成功 Mock，文件管理器根本没开
+        app = str(params.get("app") or "").strip() or step.get("target", "")
         desktop = self._resolve_desktop(app)
         # 1) gtk-launch：找不到 .desktop 会返回非 0，必须检查返回码，
         #    否则 Popen 不等待会谎报"已启动"。
@@ -234,9 +245,86 @@ class Automator:
         return {"message": f"[Mock] 启动应用 {app}（{desktop}）",
                 "simulated": True}
 
+    def _nautilus_showing(self, base: str) -> bool:
+        """任一文件管理器窗口标题包含 base（Nautilus 标题=当前文件夹名）。"""
+        try:
+            import gi
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi
+            desk = Atspi.get_desktop(0)
+            for i in range(desk.get_child_count()):
+                app = desk.get_child_at_index(i)
+                if "nautilus" not in (app.get_name() or "").lower():
+                    continue
+                for j in range(app.get_child_count()):
+                    f = app.get_child_at_index(j)
+                    if f.get_role_name() == "frame" \
+                            and base.lower() in (f.get_name() or "").lower():
+                        return True
+        except Exception:
+            pass
+        return False
+
     def navigate(self, step, element_info, params):
-        path = params.get("path") or step.get("target", "")
-        return {"message": f"[Mock] 导航到 {path}"}
+        """打开文件管理器并跳转到 path。
+
+        三段式：GUI 键鼠链（Ctrl+L→键入→回车）优先 —— 这是对任务书
+        "GUI 自动化"的展示；随后 AT-SPI 验证窗口标题，未生效自动 CLI
+        兜底（nautilus path）—— 键鼠落点受焦点影响不可靠，结果优先。"""
+        path = (params.get("path") or step.get("target", "")).strip()
+        if not path:
+            return {"success": False, "error": "缺少要打开的路径"}
+        base = os.path.basename(path.rstrip("/")) or path
+
+        # 1) 拉起/聚焦文件管理器（params.app 优先，缺省文件管理器）
+        app = str(params.get("app") or "").strip() or "文件管理器"
+        self.open_app(step, element_info, {"app": app})
+        time.sleep(2)
+
+        # 2) GUI 键鼠链
+        if self.atspi:
+            self.atspi.hotkey("ctrl", "l")
+            time.sleep(0.3)
+            self.atspi.type_text(path)
+            time.sleep(0.3)
+            self.atspi.hotkey("enter")
+        elif _REAL:
+            import pyautogui
+            pyautogui.hotkey("ctrl", "l")
+            pyautogui.typewrite(path, interval=0.02)
+            pyautogui.press("enter")
+        time.sleep(1.5)
+
+        # 3) 验证 + 兜底：目标目录不存在时先创建（"打开目录"的合理语义），
+        #    再 CLI 兜底打开；创建被拒（如 /home/user 需 root）则如实失败
+        verified = self._nautilus_showing(base)
+        fallback = False
+        if not verified:
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                pass
+        if not verified and shutil.which("nautilus"):
+            subprocess.Popen(["nautilus", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            fallback = True
+            time.sleep(2.5)
+            verified = self._nautilus_showing(base)
+        note = "GUI 键鼠链生效" if verified and not fallback else \
+               ("CLI 兜底生效" if verified else "未能确认（路径可能不存在）")
+        return {"success": verified,
+                "message": f"导航到 {path}（{note}）",
+                "verified": verified, "fallback": fallback}
+
+    def wait(self, step, element_info, params):
+        """等待若干秒（打开应用后等窗口就绪，再执行后续键鼠链）。"""
+        try:
+            seconds = max(0.0, float(params.get("seconds", 1) or 1))
+        except (TypeError, ValueError):
+            seconds = 1.0
+        time.sleep(seconds)
+        return {"message": f"等待 {seconds}s（窗口/页面就绪）", "waited": seconds}
 
     # ---------------------------------------------------------- --
     @staticmethod

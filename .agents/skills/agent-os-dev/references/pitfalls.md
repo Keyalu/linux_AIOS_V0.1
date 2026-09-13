@@ -30,6 +30,11 @@
 - 修复：网页操作走 **CDP（Chrome DevTools Protocol）**——`src/web_automation.py`（零依赖 RFC6455 WebSocket 客户端 + Runtime.evaluate 定位 + Input.dispatchMouseEvent 真实点击），AppArmor 不拦 localhost。已实测 open→find→click→URL 跳转全链路。
 - 教训：① snap 化 Ubuntu 上"用 a11y 控制浏览器"的前提先验证 AppArmor；② CDP 必须用**独立 user-data-dir**（否则被单实例代理吞掉）+ `/json/new` 专用标签页（复用旧标签会被内存节省丢弃，evaluate 永久无响应）；③ 同进程测试套件里改 `AIOS_CDP_PORT`/`AIOS_WEB_BROWSER` 环境变量必须恢复并复位 `_AUTO` 单例，否则污染后续测试。
 
+### 现象：改了代码、刷新了页面，行为还是旧的
+- 根因：8788 是常驻进程，Python 模块在启动时加载——只刷新浏览器拿到的仍是旧代码；hgfs 挂载下 mtime 粒度还会让 .pyc 缓存失效失灵。
+- 修复：清 `__pycache__` → 按端口杀进程 → 重启；**验证必须打运行中的服务**（如 /api/plan 实际发一次），不能只在独立进程里跑同一段逻辑——独立进程永远读源码，会掩盖服务未重启。
+- 教训：声称"已重启"之前，先从服务端口验证一次行为。
+
 ### 现象：orchestrate 卡在 LLM 无响应 / 页面操作静默无效果
 - 排查顺序：先探测 `http://127.0.0.1:9222/json/version`（无 curl 用 python urllib）确认 CDP 端口，再看窗口标题是否变化、`session_log` 里 `effect` 字段。
 

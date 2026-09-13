@@ -33,6 +33,7 @@ class MockToolRegistry(IToolRegistry):
         func: ToolFunc,
         schema: ToolSchema | None = None,
     ) -> None:
+        # 与真实实现同签名；schema 可缺省（Mock 只求接口一致）
         self._tools[name] = func
         if schema:
             self._schemas[name] = schema
@@ -67,9 +68,11 @@ class MockToolRegistry(IToolRegistry):
     def _register_defaults(self) -> None:
         """注册一组默认工具的 Mock 版本。"""
 
+        # 万能空函数：所有 Mock 工具都指向它，绝不执行真实操作
         def _noop(**kwargs: Any) -> dict:
             return {"success": True, "result": "[Mock] 模拟执行"}
 
+        # 与真实 default_tools 同名的 8 个工具（schema 形状一致，便于第3组联调）
         defaults = [
             ("copy_file", "复制文件", ["src", "dest"]),
             ("move_file", "移动文件", ["src", "dest"]),

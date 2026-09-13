@@ -42,7 +42,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # 任务书 七.2 演示场景表（GUI 场景在 Mock 后端下模拟执行，文件场景真实执行）
 DEMO_SCENARIOS = [
     ("场景1 基础 GUI", "打开文件管理器"),
-    ("场景2 导航操作", "导航到 /home/user/Documents"),
+    ("场景2 导航操作", "导航到 /tmp"),   # 任务书原路径 /home/user/Documents 本机不存在
     ("场景3 按钮点击", "创建 project 文件夹"),
     ("场景5 窗口切换", "切换到浏览器"),
     ("场景6 复杂任务", "帮我把「demo_task」文件夹里的文件整理一下，顺便看看有没有重复文件，最后备个份"),

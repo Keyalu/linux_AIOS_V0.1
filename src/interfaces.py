@@ -108,6 +108,7 @@ class ToolResult:
     success: bool
     result: Any = None
     error: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)  # 附加键（simulated 等）
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"success": self.success}
@@ -115,6 +116,8 @@ class ToolResult:
             d["result"] = self.result
         else:
             d["error"] = self.error
+        if self.extra:
+            d.update(self.extra)
         return d
 
     @staticmethod

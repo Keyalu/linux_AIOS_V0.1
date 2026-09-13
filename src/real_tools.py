@@ -78,6 +78,7 @@ def take_screenshot(path: str = "") -> dict:
         import gi
         gi.require_version("Gdk", "3.0")
         from gi.repository import Gdk
+        # 抓根窗口（整屏）→ 转 pixbuf → 按扩展名存 PNG/JPEG
         screen = Gdk.Screen.get_default().get_root_window()
         if screen is None:
             return {"success": False,
@@ -86,6 +87,7 @@ def take_screenshot(path: str = "") -> dict:
         pb = Gdk.pixbuf_get_from_window(screen, 0, 0, w, h)
         if pb is None:
             return {"success": False, "error": "执行异常: 屏幕抓取失败"}
+        # 未给路径则落到 /tmp 按时间戳命名，避免覆盖旧截图
         target = path.strip() or f"/tmp/agent_os_screenshot_{int(time.time())}.png"
         if not target.lower().endswith((".png", ".jpg", ".jpeg")):
             target += ".png"
@@ -151,6 +153,7 @@ def send_email(
             "error": f"参数错误: 收件人格式不正确或为空（支持字符串/列表），收到: {to!r}",
         }
 
+    # 说明：下方先构建一版 msg 校验收件人，附件归一后会再完整重建一次
     # ---- 构建邮件（干跑与真实发送共用）----
     sender = user or os.environ.get("SMTP_USER", "agent@example.com")
     msg = EmailMessage()
@@ -184,6 +187,7 @@ def send_email(
         except OSError as e:
             return {"success": False, "error": f"附件读取失败: {apath.name}: {e}"}
 
+    # 干跑分支：返回邮件全貌预览，绝不联网
     if dry_run:
         return {
             "success": True,
@@ -214,6 +218,7 @@ def send_email(
 
     # ---- 真实发送 ----
     try:
+        # 465=SMTP_SSL 直连；其他端口走 STARTTLS 明文升级
         if port == 465:
             with smtplib.SMTP_SSL(host, port, timeout=15) as s:
                 s.login(user, password)

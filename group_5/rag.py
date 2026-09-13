@@ -49,6 +49,7 @@ class RAGKnowledgeBase:
 
     # ---------------------------------------------------------- --
     def add_trace(self, user_input: str, actions: list, result: str) -> dict:
+        # 一条轨迹 = 输入话语 + 动作序列 + 结果摘要（trace_id 全局唯一）
         doc = {
             "trace_id": f"trace-{uuid.uuid4().hex[:8]}",
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -62,6 +63,7 @@ class RAGKnowledgeBase:
 
     def query(self, query_text: str, k: int = 3) -> list[dict]:
         q = _tokenize(query_text)
+        # 每条轨迹算 查询向量 vs (输入+动作) 向量 的余弦相似度，按相似度排序取 top-k
         scored = sorted(
             (( _cosine(q, _tokenize(d["input"] + " " + " ".join(
                 d["actions"] if isinstance(d["actions"], list) else [str(d["actions"])]))), d)

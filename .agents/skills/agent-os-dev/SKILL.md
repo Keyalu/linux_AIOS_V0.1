@@ -29,7 +29,7 @@ python3 .agents/skills/agent-os-dev/scripts/pytest_shim.py tests/test_integratio
 
 1. **接口契约不可破坏**。五组输出契约：intent_json / plan_json(steps+elements) / result_json(success+before_state+after_state) / tool_result_json / check_json。改动字段前先确认下游（组2 消费 intent、组3 消费 plan、组5 对账 session+stats）。
 2. **组间解耦纪律**：组2 只看 schema JSON（禁止 import 组4）；组3 只走公开契约（`registry.call` / `skills.call_skill`）；组5 只读落盘 JSON（禁止 import 组4 任何代码）。违反会让"Mock 换真实零改动"的架构承诺失效。
-3. **确定性归一**：LLM 输出有随机性，凡影响执行语义的字段必须在组1 后处理层强制归一，不信任 LLM 原样输出。已有范式：`send_email.dry_run`（出现发邮件动作=真发，起草词=干跑）、`attachment`（话语中的真实文件路径强制覆盖 LLM 的 null）、文件路径宿主环境解析。新增执行语义字段时照此办理。
+3. **确定性归一**：LLM 输出有随机性，凡影响执行语义的字段必须在组1 后处理层强制归一，不信任 LLM 原样输出。已有范式：`send_email.dry_run`（出现发邮件动作=真发，起草词=干跑）、`attachment`（话语中的真实文件路径强制覆盖 LLM 的 null）、文件路径宿主环境解析。新增执行语义字段时照此办理。**动作选择本身也是执行语义字段**：规划后经 `group_2/route_policy.py` 决策表按计划图消费分析确定性改写通道（如裸搜索→web_search、数据链→mcp_search），改写留 route_reason/routes 审计——新增语义近邻工具（目标相同、通道不同）必须同步其歧义组，否则决策表会 blind spot。
 4. **会话状态按运行隔离**：GUI 服务的 AppAgent 是常驻单例、跨运行复用，`escalated`/`self_healed` 会话列表必须在 `execute_plan` 开头重置——否则历史运行的提权/自愈记录泄进新会话，事件重复、审计对账失真。
 5. **确认即执行所确认的方案**：`PENDING[token]` 存储完整 `{intent, plan, check}`，`/api/execute` 原样执行，执行阶段零 LLM 调用。**禁止确认后重新规划**——二次规划会导致确认方案≠执行方案（曾导致空附件邮件）、双倍延迟。
 6. **敏感数据不外流**：`system_out/` 含 LLM Key 与 SMTP 授权码，打包/git 必须排除整个目录；文件整理类工具必须跳过系统账本文件。

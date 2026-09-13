@@ -7,7 +7,7 @@
   组4 schema 目录填写，不硬编码 —— 组4 改名自动跟随。
 
 plan_json 契约：{"steps":[{step_id, kind, action, target, params,
-requires_admin, description}], "elements": {...}, "policy": {...},
+requires_admin, description}], "elements": {引用的元素}, "policy": 短码,
 "unresolved": [...]}
 """
 
@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 import time
 import uuid
+
+from .route_policy import apply_route_policy
 
 # intent 动作 → (步骤类别, 组4 公开名)
 _SKILL_ACTIONS = {
@@ -39,7 +41,10 @@ _TOOL_ACTIONS = {
     "search": "mcp_search", "translate": "mcp_translate",
     "write_file": "write_file", "run_command": "run_command",
     "take_screenshot": "take_screenshot",
-    "web_open": "web_open", "web_click": "web_click", "web_state": "web_state",
+    "web_search": "web_search", "web_open": "web_open",
+    "web_click": "web_click", "web_state": "web_state",
+    "web_extract": "web_extract", "answer": "llm_answer",
+    "web_close_browser": "web_close_browser",
 }
 
 
@@ -90,18 +95,20 @@ class TaskPlanner:
             })
         steps = self.renumber(steps)
 
+        # 通道一致性保障（方案一）：LLM/规则选的 action 只是提案，语义近邻组
+        # 的通道由决策表 + 计划图消费分析确定性改写（改写留 route_reason）
+        routes = apply_route_policy(intent.get("user_text", ""), steps,
+                                    self._schemas or None)
+
         return {
             "plan_id": f"plan-{uuid.uuid4().hex[:8]}",
             "based_on": intent.get("intent_id"),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "target": target,
             "steps": steps,
+            "routes": routes,
             "elements": self._elements_for(steps),
-            "policy": {
-                "on_permission_denied": "请求用户确认后提权重试一次",
-                "on_tool_not_found": "用 list_tools 模糊匹配纠错",
-                "on_other_fail": "记录并继续后续步骤",
-            },
+            "policy": "escalate-once | selfheal-name | continue-on-fail",
             "unresolved": unresolved,
         }
 
@@ -208,6 +215,10 @@ class TaskPlanner:
                     or last_file_target or ""
                 params.setdefault("src", src_fb or target)
                 params.setdefault("dest", (src_fb or target).rstrip("/\\") + "_backup")
+        # llm_answer：text 缺省自动接线到上一步输出（消费分析据此把前置
+        # 搜索改写为数据通道 mcp_search）；question 由 LLM/规则提供
+        if name == "llm_answer":
+            params.setdefault("text", "{{prev_result}}")
         return params
 
     # ---------------------------------------------------------- --
@@ -242,12 +253,14 @@ class TaskPlanner:
                     f"点击 {name}" + ("（已定位）" if el else "（执行时定位）"))]
         elif action == "navigate":
             path = params_in.get("path") or target
-            gui = [("hotkey", {"keys": ["ctrl", "l"]}, "聚焦地址栏"),
-                   ("type", {"text": path}, f"输入路径 {path}"),
-                   ("hotkey", {"keys": ["enter"]}, "回车跳转")]
+            # 单步 navigate：组3 原生实现 = 打开文件管理器 → GUI 键鼠链
+            # （Ctrl+L→键入→回车）→ AT-SPI 验证 → CLI 兜底，见 automator
+            gui = [("navigate", {"path": path}, f"打开文件管理器并跳转到 {path}")]
         elif action == "create_folder":
             name = params_in.get("name") or "new_folder"
-            gui = [("hotkey", {"keys": ["ctrl", "shift", "n"]}, "新建文件夹"),
+            gui = [("open_app", {"app": "文件管理器"}, "先打开文件管理器"),
+                   ("wait", {"seconds": 2}, "等待文件管理器就绪"),
+                   ("hotkey", {"keys": ["ctrl", "shift", "n"]}, "新建文件夹"),
                    ("type", {"text": name}, f"输入名称 {name}"),
                    ("hotkey", {"keys": ["enter"]}, "确认")]
         elif action == "switch_window":

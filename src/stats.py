@@ -25,13 +25,16 @@ class ToolStats(IToolStats):
 
     def __init__(self, log_path: str | None = None) -> None:
         self._log_path = log_path
+        # 双结构：_records 逐笔流水（GUI 逐笔页），_counters 按工具聚合（报表）
         self._records: list[dict[str, Any]] = []
         self._counters: dict[str, dict[str, int]] = {}
+        # 传入 log_path 即从磁盘续账（跨运行累积账本，持久性）
         if log_path:
             self._load()
 
     def record(self, record: CallRecord) -> None:
         """记录一次工具调用。"""
+        # 逐笔条目：时间/工具/参数/成败/耗时；失败时附 error
         entry = {
             "time": datetime.now().isoformat(),
             "tool": record.tool_name,
@@ -44,6 +47,7 @@ class ToolStats(IToolStats):
 
         self._records.append(entry)
 
+        # 聚合计数：每个工具维护 calls/success/fail 三元组
         c = self._counters.setdefault(
             record.tool_name, {"calls": 0, "success": 0, "fail": 0}
         )
@@ -51,6 +55,8 @@ class ToolStats(IToolStats):
         if record.success:
             c["success"] += 1
         else:
+
+        # 每笔即落盘：进程崩溃最多丢当前一笔（原子写）
             c["fail"] += 1
 
         if self._log_path:
@@ -100,6 +106,7 @@ class ToolStats(IToolStats):
             "counters": self._counters,
             "updated": datetime.now().isoformat(),
         }
+        # 原子写：先写临时文件再 os.replace 原子替换，写一半崩溃也不损坏账本
         dir_name = os.path.dirname(self._log_path) or "."
         try:
             with tempfile.NamedTemporaryFile(
@@ -117,6 +124,7 @@ class ToolStats(IToolStats):
                 data = json.load(f)
                 self._records = data.get("records", [])
                 self._counters = data.get("counters", {})
+        # 首次运行/账本损坏 → 从零开始，不让历史问题拖垮当前编排
         except (FileNotFoundError, json.JSONDecodeError):
             self._records = []
             self._counters = {}

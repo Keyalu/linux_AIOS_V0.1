@@ -25,11 +25,13 @@ class AIShell:
         while True:
             try:
                 line = input("\ncosh> ").strip()
+            # Ctrl-D / Ctrl-C 优雅退出
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
             if not line:
                 continue
+            # 内置命令：exit/quit/help/history；其余一律当自然语言指令
             if line.lower() in ("exit", "quit"):
                 break
             if line == "help":
@@ -42,6 +44,7 @@ class AIShell:
 
     def handle(self, line: str) -> dict:
         """处理一条输入：有协调器走完整编排，否则只做意图理解。"""
+        # 双模式：注入协调器 = 完整编排；只注入 HostAgent = 仅意图理解演示
         if self.coordinator is not None:
             bundle = self.coordinator.orchestrate(line)
             self.history.append({"user": line, "bundle": bundle})

@@ -78,6 +78,24 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
 .badge-use{background:var(--blue-bg);color:var(--blue)}
 .badge-pub{background:#f1f5f9;color:var(--sub)}
 .hit b{font-size:13px}.hit .m{font-size:12px;color:var(--sub);margin:4px 0}
+/* ---------- 对话助手 ---------- */
+.chat-log{height:430px;overflow:auto;background:#fbfdff;border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.bubble{max-width:78%;padding:9px 13px;border-radius:12px;font-size:13px;white-space:pre-wrap;word-break:break-all;line-height:1.55}
+.bubble.user{align-self:flex-end;background:var(--blue);color:#fff;border-bottom-right-radius:4px}
+.bubble.assistant{align-self:flex-start;background:#fff;border:1px solid var(--line);border-bottom-left-radius:4px}
+.bubble.assistant.err{background:var(--red-bg);border-color:var(--red);color:var(--red)}
+.bubble.op-card{border-color:var(--amber);background:var(--amber-bg);max-width:92%}
+.chat-input-row{display:flex;gap:10px;margin-top:12px;align-items:flex-end}
+.bubble pre.md-code{background:#0f172a;color:#e2e8f0;padding:10px 12px;border-radius:8px;overflow:auto;font-size:12px;margin:6px 0;font-family:Consolas,monospace}
+.bubble code{background:rgba(148,163,184,.18);padding:1px 5px;border-radius:4px;font-family:Consolas,monospace;font-size:12px}
+.bubble pre.md-code code{background:none;padding:0}
+.bubble .md-h{font-weight:700;margin:8px 0 2px}
+.bubble .md-h1{font-size:15px}.bubble .md-h2{font-size:14px}.bubble .md-h3,.bubble .md-h4{font-size:13px}
+.bubble .md-hr{border:0;border-top:1px solid var(--line);margin:8px 0}
+.bubble ul,.bubble ol{margin:4px 0;padding-left:20px}
+.bubble li{margin:2px 0}
+.bubble .md-p{margin:2px 0}
+.bubble a{color:var(--blue);word-break:break-all}
 </style>
 </head>
 <body>
@@ -86,6 +104,7 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
   <span class="warn">⚠ 编排会执行真实 OS 操作 —— 演示请用沙箱目录</span>
   <nav>
     <button data-p="orch" class="on">编排控制台</button>
+    <button data-p="chat">对话助手</button>
     <button data-p="tools">工具台</button>
     <button data-p="stats">系统统计</button>
     <button data-p="rag">RAG 知识库</button>
@@ -156,6 +175,28 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
     </div>
     <div class="result plain" id="orch-json">—</div>
   </div>
+
+  <div class="card">
+    <h2>运行历史<span style="font-weight:400;font-size:12px;color:var(--sub)">　编排控制台与对话助手发起的执行都在此记录，点击行可回看</span>
+      <button class="ghost" style="margin-left:12px" onclick="loadRuns()">刷新</button></h2>
+    <table style="margin-top:10px"><thead><tr><th>时间</th><th>来源</th><th>指令</th><th>状态</th><th>结果</th></tr></thead>
+    <tbody id="runs-rows"><tr><td colspan="5" class="empty">暂无运行</td></tr></tbody></table>
+  </div>
+</section>
+
+<!-- ============ 对话助手 ============ -->
+<section class="page" id="page-chat">
+  <div class="card">
+    <h2>对话助手<span style="font-weight:400;font-size:12px;color:var(--sub)">　直连 LLM 厂商（流式输出）；说出系统操作会弹出执行卡片，确认后才真实执行</span></h2>
+    <div id="chat-log" class="chat-log">
+      <div class="bubble assistant">你好，我是控制台对话助手。直接提问即可；说出系统操作（如"打开文件管理器"）会弹出执行卡片，点击「执行」才会真实运行并走完整安全管线。</div>
+    </div>
+    <div class="chat-input-row">
+      <textarea id="chat-input" rows="2" style="flex:1" placeholder="输入消息，Enter 发送 / Shift+Enter 换行"></textarea>
+      <button class="go" id="chat-send" onclick="sendChat()">发送</button>
+      <button class="ghost" onclick="clearChat()">清空对话</button>
+    </div>
+  </div>
 </section>
 
 <!-- ============ 工具台 ============ -->
@@ -179,7 +220,7 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
 <section class="page" id="page-stats">
   <div class="card">
     <div class="toolbar" style="display:flex;gap:10px;align-items:center">
-      <label style="font-size:12.5px;color:var(--sub)"><input type="checkbox" id="auto" checked> 每 2 秒自动刷新</label>
+      <label style="font-size:12.5px;color:var(--sub)"><input type="checkbox" id="auto"> 每 2 秒自动刷新</label>
       <button class="ghost" onclick="refreshStats()">手动刷新</button>
       <button class="ghost" onclick="clearStats()">🗑 清空系统账本</button>
       <span id="stats-updated" style="font-size:12px;color:var(--sub)"></span>
@@ -239,6 +280,8 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
 <section class="page" id="page-settings">
   <div class="card">
     <h2>编排行为<span style="font-weight:400;font-size:12px;color:var(--sub)">　这些旋钮即时生效、持久保存，不会影响系统骨架</span></h2>
+    <div class="field"><label>默认工作区<span class="tip">文件操作（整理/备份/写入/打开目录）的默认根目录；留空 = system_out/demo_task。目录会自动创建</span></label>
+      <input id="set-workspace" style="width:100%" placeholder="如 /home/keyal/AIOS工作区"></div>
     <div class="field"><label>组1 意图引擎</label>
       <select id="set-engine" style="width:100%">
         <option value="llm">LLM（需已在 LLM 设置配置 Key）</option>
@@ -302,6 +345,8 @@ document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
   b.classList.add("on");$("#page-"+b.dataset.p).classList.add("on");
   if(b.dataset.p==="stats")refreshStats();
   if(b.dataset.p==="rag")ragQuery();
+  if(b.dataset.p==="chat")loadChatHistory();
+  if(b.dataset.p==="orch")loadRuns();
   if(b.dataset.p==="llm"){loadLLM();loadSMTP()}
   if(b.dataset.p==="settings")loadSettings();
 });
@@ -314,8 +359,9 @@ async function post(url,body){const r=await fetch(url,{method:"POST",
 
 let CURSOR=0,RUN_ID=null,POLL=null,LAST_ENGINE="rules";
 function _flowTo(n){/* 点亮前 n 个盒子 */}
+/* 发起编排：先 /api/plan 规划；需确认则弹面板，否则直接开始轮询事件流 */
 async function orchestrate(){
-  const btn=$("#orch-run");btn.disabled=true;btn.textContent="组1 意图理解中（LLM，最长约 1 分钟）…";
+  const btn=$("#orch-run");btn.disabled=true;btn.textContent="组1 意图理解中（LLM，复杂任务最长约 2 分钟）…";
   $("#orch-confirm").style.display="none";
   const v=$("#orch-verdict");v.className="verdict";v.textContent="";
   FLOW.forEach(id=>document.getElementById(id).classList.remove("lit"));
@@ -337,6 +383,7 @@ async function orchestrate(){
     PIPE_TOKEN=staged.token;
     $("#orch-confirm").style.display="block";
     $("#orch-confirm-detail").innerHTML=
+      (staged.degraded?'<div class="bad" style="margin-bottom:6px">⚠ LLM 不可用，本计划由规则引擎粗略解析 —— 复杂任务建议稍后重试</div>':"")+
       `<div>本计划包含<b>高影响动作</b>，需要你批准：</div>`+
       staged.admin_steps.map(s=>`<div>🔑 步骤${s.step} <code>${esc(s.action)}</code> 需要提权 ADMIN</div>`).join("")+
       staged.real_send_steps.map(s=>`<div>📧 步骤${s.step} <code>send_email</code> 将<b>真实发送</b>：to=${esc(s.params.to||"")} 主题=${esc(s.params.subject||"")}${s.params.attachment?` 附件=${esc(s.params.attachment)}`:""}</div>`).join("");
@@ -352,6 +399,7 @@ function showStaged(staged){
      <div class="kpi"><div class="v bl">${staged.plan.steps.length}</div><div class="l">规划步骤</div></div>
      <div class="kpi"><div class="v" style="font-size:14px;padding-top:8px">${esc(it.action||"-")}</div><div class="l">意图动作</div></div>`;
 }
+/* 确认面板按钮：full=全部执行（含提权） safe=只跑免提权步骤 cancel=取消 */
 async function confirmExecute(mode){
   if(mode==="cancel"){$("#orch-confirm").style.display="none";$("#orch-steps").innerHTML='<tr><td colspan="5" class="empty">已取消</td></tr>';return}
   $("#orch-confirm").style.display="none";
@@ -367,6 +415,7 @@ async function startPolling(run_id){
   POLL=setInterval(pollRun,800);
   pollRun();
 }
+/* 每 800ms 增量拉事件：点亮五组流程图、追加执行明细行；终态后渲染 bundle */
 async function pollRun(){
   if(!RUN_ID)return;
   let d;
@@ -403,6 +452,7 @@ function litFlow(n){
   FLOW.forEach((id,i)=>{const el=document.getElementById(id);
     if(i<n)el.classList.add("lit");else el.classList.remove("lit")});
 }
+/* 渲染最终结果：KPI 卡片 + 步骤表（提权高亮）+ 提权/自愈事件 + 审计 JSON */
 function renderBundle(){
   const a=BUNDLE.audit||{};
   const v=$("#orch-verdict");v.className="verdict "+(a.verdict==="PASS"?"pass":"fail");
@@ -447,6 +497,204 @@ function showPipeJson(which){
 }
 document.querySelectorAll("#orch-tabs button").forEach(b=>b.onclick=()=>showPipeJson(b.dataset.a));
 
+/* ---------- 对话助手 ---------- */
+/* ---------- 运行历史（编排控制台 + 对话助手） ---------- */
+async function loadRuns(){
+  const d=await fetch("/api/runs").then(r=>r.json());
+  const runs=d.runs||[];
+  $("#runs-rows").innerHTML=runs.length?runs.map(r=>{
+    const st=r.summary||{};
+    const src=r.source==="chat"?'<span class="tag t-mcp">对话</span>':'<span class="tag t-tool">控制台</span>';
+    const status=r.status==="done"?'<span class="chip ok">完成</span>'
+      :r.status==="running"?'<span class="chip esc">运行中</span>'
+      :r.status==="rejected"?'<span class="chip bad">已拦截</span>':'<span class="chip bad">失败</span>';
+    const res=r.verdict?`审计 <b class="${r.verdict==="PASS"?"ok":"bad"}">${r.verdict}</b>（${st.success??0}/${st.total??0}）`:"—";
+    return `<tr style="cursor:pointer" onclick="loadRun('${r.id}')">
+      <td><code>${esc(r.time||"")}</code></td><td>${src}</td>
+      <td>${esc((r.text||"").slice(0,42))}</td><td>${status}</td><td>${res}</td></tr>`;
+  }).join(""):'<tr><td colspan="5" class="empty">暂无运行 —— 编排或对话里发起一次即可看到</td></tr>';
+}
+async function loadRun(rid){
+  const d=await fetch(`/api/run?id=${rid}&cursor=0`).then(r=>r.json());
+  if(!d.bundle)return;
+  BUNDLE=d.bundle;renderBundle();showPipeJson("plan");
+}
+let CHAT=[];
+function addBubble(role,text){
+  const b=document.createElement("div");b.className="bubble "+role;b.textContent=text;
+  const log=$("#chat-log");log.appendChild(b);log.scrollTop=log.scrollHeight;return b;
+}
+function clearChat(){CHAT=[];$("#chat-log").innerHTML='<div class="bubble assistant">对话已清空。有什么可以直接问我。</div>';saveChatHistory()}
+/* 对话内系统操作：执行卡片 → 用户点击 → 完整编排管线（安全+确认流） */
+function addOperationCard(ev){
+  const card=document.createElement("div");card.className="bubble assistant op-card";
+  card.dataset.text=ev.user_text||"";
+  card.innerHTML=`<div>🎯 检测到系统操作：<b>${esc((ev.actions||[]).join(" → "))}</b></div>
+    <div style="font-size:11.5px;color:var(--sub);margin:4px 0">将走完整编排管线（安全检查+确认流），真实操作请确认。</div>
+    <div style="display:flex;gap:8px">
+      <button class="go" style="padding:6px 16px" onclick="execOperation(this)">执行</button>
+      <button class="ghost" style="padding:6px 12px" onclick="this.closest('.op-card').remove()">忽略</button>
+    </div>`;
+  $("#chat-log").appendChild(card);$("#chat-log").scrollTop=$("#chat-log").scrollHeight;
+}
+async function execOperation(btn){
+  const card=btn.closest(".op-card");const text=card.dataset.text;
+  card.remove();
+  const line=addBubble("assistant","⏳ 规划中…");
+  const staged=await post("/api/plan",{user_text:text,source:"chat"});
+  if(staged.ok===false||staged.rejected){
+    line.classList.add("err");line.textContent="⛔ "+(staged.rejected||staged.error||"被安全检查拦截");return}
+  if(staged.pending){
+    line.innerHTML="<div>⚠ 计划包含高影响动作，需要你确认：</div>"+
+      staged.admin_steps.map(s=>`<div>🔑 步骤${s.step} <code>${esc(s.action)}</code> 需提权 ADMIN</div>`).join("")+
+      staged.real_send_steps.map(s=>`<div>📧 步骤${s.step} 将<b>真实发送</b></div>`).join("");
+    const bar=document.createElement("div");bar.style.display="flex";bar.style.gap="8px";bar.style.marginTop="6px";
+    bar.innerHTML='<button class="go" style="padding:6px 16px">✓ 全部允许并执行</button>'+
+      '<button class="ghost" style="padding:6px 12px">仅执行免提权步骤</button>';
+    const [bAll,bSafe]=bar.querySelectorAll("button");
+    bAll.onclick=()=>{bar.remove();runStaged(line,staged,"full",text)};
+    bSafe.onclick=()=>{bar.remove();runStaged(line,staged,"safe",text)};
+    line.appendChild(bar);$("#chat-log").scrollTop=$("#chat-log").scrollHeight;return;
+  }
+  runStaged(line,staged,"auto",text);
+}
+async function runStaged(line,staged,mode,origText){
+  let run_id=staged.run_id;
+  if(staged.pending){
+    line.textContent="⏳ 已确认，启动执行…";
+    const r=await post("/api/execute",{token:staged.token,mode,source:"chat"});
+    run_id=r.run_id;
+  }
+  if(!run_id){line.classList.add("err");line.textContent="✗ 未获得运行 id";return}
+  line.textContent="⏳ 执行中…";let cursor=0,polls=0;
+  while(polls++ < 240){
+    let d;
+    try{d=await fetch(`/api/run?id=${run_id}&cursor=${cursor}`).then(r=>r.json())}
+    catch(e){await new Promise(r=>setTimeout(r,800));continue}
+    cursor=d.cursor;
+    for(const e of d.events){
+      if(e.stage==="step"){
+        const tr=e.step.tool_result||{};
+        const div=document.createElement("div");
+        div.innerHTML=`步骤${e.step.step} <code>${esc(e.step.name)}</code> `+
+          `<span class="chip ${tr.success?"ok":"bad"}">${tr.success?"成功":"失败"}</span>`+
+          (tr.success?"":` <span class="bad" style="font-size:11px">${esc(tr.error||"")}</span>`);
+        line.appendChild(div);
+      }
+      if(e.stage==="rejected"){const div=document.createElement("div");div.textContent="⛔ "+(e.reason||"被拒绝");line.appendChild(div)}
+    }
+    if(d.status==="done"||d.status==="rejected"||d.status==="failed"){
+      const sess=d.bundle&&d.bundle.session;
+      const a=d.bundle&&d.bundle.audit;
+      const sum=sess?sess.summary:{};
+      const ok=sum.success!=null?`${sum.success}/${sum.total} 步成功`:"";
+      // 计划里的 llm_answer 产出 = 用户要的"回答"：提取为独立气泡
+      // （markdown 渲染），并连同原始问题写入聊天历史（追问有上下文）
+      let answered=false;
+      if(sess){
+        for(const st of sess.steps.filter(x=>x.name==="llm_answer"
+            &&(x.tool_result||{}).success)){
+          const res=st.tool_result.result||{};
+          if(res.answer){
+            addBubble("assistant",res.answer).innerHTML=mdRender(res.answer);
+            answered=true;
+          }
+        }
+        if(answered&&origText){
+          CHAT.push({role:"user",content:origText},
+                    {role:"assistant",content:sess.steps
+                      .filter(x=>x.name==="llm_answer").pop().tool_result.result.answer});
+          saveChatHistory();
+        }
+      }
+      // 完成提示用独立气泡，醒目且不被步骤列表淹没
+      if(a&&a.verdict==="PASS")
+        addBubble("assistant",`✅ 任务完成：${ok}，审计 PASS`);
+      else if(a)
+        addBubble("assistant",`❌ 任务结束：${ok||"无步骤"}，审计 ${a.verdict}`);
+      else
+        addBubble("assistant","❌ 任务失败："+esc(d.error||"未知错误"));
+      line.appendChild(document.createElement("div"));   // 占位收尾
+      $("#chat-log").scrollTop=$("#chat-log").scrollHeight;return;
+    }
+    await new Promise(r=>setTimeout(r,700));
+  }
+  addBubble("assistant","❌ 执行超时（超过 3 分钟未收到完成事件），可到编排控制台查看历史");
+}
+/* markdown 轻量渲染：LLM 输出 → 气泡内风格化 HTML。
+   先整体 HTML 转义再做 markdown 变换（LLM 输出不可信，防注入），
+   代码围栏内的内容只转义、不做行内变换。 */
+function mdRender(src){
+  const inline=t=>esc(t)
+    .replace(/`([^`]+)`/g,"<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g,"$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|[\s（(])((?:https?:\/\/)[^\s<）)]+)/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  let html="",inCode=false,code=[],list=null;
+  const closeList=()=>{if(list){html+=list==="ul"?"</ul>":"</ol>";list=null}};
+  for(const raw of String(src).split("\n")){
+    if(/^\s*```/.test(raw)){
+      if(inCode){html+='<pre class="md-code">'+esc(code.join("\n"))+"</pre>";code=[];inCode=false}
+      else{closeList();inCode=true;code=[]}
+      continue;
+    }
+    if(inCode){code.push(raw);continue}
+    const h=raw.match(/^(#{1,4})\s+(.*)/);
+    if(h){closeList();html+='<div class="md-h md-h'+h[1].length+'">'+inline(h[2])+"</div>";continue}
+    if(/^\s*(-{3,}|\*{3,})\s*$/.test(raw)){closeList();html+='<hr class="md-hr">';continue}
+    const ul=raw.match(/^\s*[-*]\s+(.*)/),ol=raw.match(/^\s*(\d+)[.、]\s+(.*)/);
+    if(ul){if(list!=="ul"){closeList();html+="<ul>";list="ul"}html+="<li>"+inline(ul[1])+"</li>";continue}
+    if(ol){if(list!=="ol"){closeList();html+='<ol start="'+ol[1]+'">';list="ol"}html+="<li>"+inline(ol[2])+"</li>";continue}
+    closeList();
+    if(!raw.trim())continue;
+    html+='<div class="md-p">'+inline(raw)+"</div>";
+  }
+  if(inCode&&code.length)html+='<pre class="md-code">'+esc(code.join("\n"))+"</pre>";
+  closeList();
+  return html;
+}
+async function sendChat(){
+  const input=$("#chat-input");const v=input.value.trim();
+  if(!v||$("#chat-send").disabled)return;
+  input.value="";CHAT.push({role:"user",content:v});addBubble("user",v);
+  const b=addBubble("assistant","思考中…");$("#chat-send").disabled=true;
+  let full="";
+  try{
+    const resp=await fetch("/api/chat",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({messages:CHAT.slice(-12)})});
+    const reader=resp.body.getReader(),dec=new TextDecoder();let buf="";
+    while(true){
+      const {done,value}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});let idx;
+      while((idx=buf.indexOf("\n\n"))>=0){
+        const seg=buf.slice(0,idx).trim();buf=buf.slice(idx+2);
+        if(!seg.startsWith("data:"))continue;
+        const ev=JSON.parse(seg.slice(5));
+        if(ev.route==="operation"){b.remove();addOperationCard(ev);return}
+        if(ev.route==="complex"){
+          b.classList.add("op-card");b.innerHTML=
+            '<div>🧭 这是多步复杂任务——请到「编排控制台」执行</div>'+
+            '<div style="font-size:11.5px;color:var(--sub);margin:4px 0">复杂任务的规划由 LLM 完成（约 1~2 分钟），对话助手只负责简单操作与问答。检测到的动作：'+
+            esc((ev.actions||[]).join(" → "))+'</div>';
+          $("#chat-log").scrollTop=$("#chat-log").scrollHeight;return}
+        if(ev.delta){if(!full)b.textContent="";full+=ev.delta;
+          b.innerHTML=mdRender(full);
+          $("#chat-log").scrollTop=$("#chat-log").scrollHeight}
+        if(ev.error){b.classList.add("err");b.textContent="✗ "+ev.error}
+      }
+    }
+    if(full){b.innerHTML=mdRender(full);CHAT.push({role:"assistant",content:full});
+      saveChatHistory()}
+    else if(!b.classList.contains("err")){b.textContent="(空回复)"}
+  }catch(e){b.classList.add("err");b.textContent="✗ 请求失败: "+e}
+  finally{$("#chat-send").disabled=false}
+  input.focus();
+}
+$("#chat-input").addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat()}});
+
 /* ---------- 工具台 ---------- */
 const SKILL_SET=new Set(["organize_downloads","find_duplicate_files","backup_directory",
   "find_large_files","disk_usage","system_check","cleanup_temp","find_files"]);
@@ -457,6 +705,7 @@ function categoryOf(t){
   if(t.name.startsWith("mcp_"))return"mcp";
   return SKILL_SET.has(t.name)?"skill":"tool";
 }
+/* 拉取 /api/tools 能力清单（组4 schema 内省：工具+技能+MCP） */
 async function initTools(){
   const d=await fetch("/api/tools").then(r=>r.json());
   TOOLS=d.tools||[];
@@ -490,6 +739,7 @@ function renderList(){
     });
   }
 }
+/* 按 inputSchema 动态生成表单：每个属性一个输入框，必填标 *，身份选择器 */
 function renderForm(t){
   cur=t;const box=$("#tool-form");
   const g=categoryOf(t),labels={tool:"工具",skill:"技能",mcp:"MCP 工具"};
@@ -515,6 +765,7 @@ function renderForm(t){
   document.querySelectorAll("#lvl button").forEach(b=>b.onclick=()=>{
     document.querySelectorAll("#lvl button").forEach(x=>x.classList.remove("on"));b.classList.add("on")});
 }
+/* 收集表单 → 类型归一（数字/布尔/去引号）→ 按选定身份调 /api/call 或 /api/skill */
 async function callTool(){
   const level=document.querySelector("#lvl button.on")?.dataset.l||"user";
   const params={};document.querySelectorAll("#tool-form [data-k]").forEach(el=>{
@@ -536,6 +787,7 @@ document.querySelectorAll("#tool-filter button").forEach(b=>b.onclick=()=>{
 
 /* ---------- 系统统计 ---------- */
 let timer=null;
+/* 拉 stats.json 账本：KPI + 按接口聚合条形图 + 逐笔流水表 */
 async function refreshStats(){
   const d=await fetch("/api/stats").then(r=>r.json());
   const s=d.summary||{};
@@ -562,7 +814,6 @@ async function refreshStats(){
   </tr>`).join(""):'<tr><td colspan="5" class="empty">暂无调用记录</td></tr>';
 }
 $("#auto").onchange=e=>{clearInterval(timer);if(e.target.checked)timer=setInterval(refreshStats,2000)};
-timer=setInterval(refreshStats,2000);
 async function clearStats(){
   if(!confirm("确认清空系统账本？（RAG 轨迹保留）"))return;
   await post("/api/reset_stats",{});refreshStats();
@@ -579,6 +830,7 @@ document.querySelector('#page-llm select')?.addEventListener("change",e=>{
   const p=PROVIDERS[e.target.value]||{};
   $("#llm-base").value=p.base||"";$("#llm-model").value=p.model||"";
 });
+/* 读取当前 LLM 配置回填表单（Key 只显示掩码，留空即沿用旧 Key） */
 async function loadLLM(){
   const d=await fetch("/api/llm").then(r=>r.json());
   if(d.base_url){$("#llm-base").value=d.base_url}
@@ -630,6 +882,7 @@ async function testSMTP(){
 }
 
 /* ---------- 控件树 ---------- */
+/* 拉取真实 AT-SPI 控件树，按深度缩进渲染成可读列表 */
 async function loadControls(){
   const box=$("#ctl-tree");box.textContent="读取真实控件树中…";
   try{
@@ -642,6 +895,7 @@ async function loadControls(){
 }
 
 /* ---------- 系统设置 ---------- */
+/* 读取系统设置回填表单（引擎/温度/身份/确认策略/受保护路径/RAG 条数） */
 async function loadSettings(){
   const d=await fetch("/api/settings").then(r=>r.json());
   const s=d.settings;
@@ -653,6 +907,7 @@ async function loadSettings(){
   $("#set-finale").checked=!!s.planner_finale;
   $("#set-protected").value=(s.protected_extra||[]).join(", ");
   $("#set-ragk").value=s.rag_k;
+  $("#set-workspace").value=s.workspace||"";
   if(!s.llm_available&&s.llm_engine==="llm")
     $("#set-status").textContent="提示：LLM 引擎已选但未配置 Key，将自动走规则 Mock";
   return s;
@@ -667,7 +922,8 @@ async function saveSettings(){
     action_delay:Number($("#set-delay").value||0.3),
     planner_finale:$("#set-finale").checked,
     protected_extra:$("#set-protected").value.split(/[,，]/).map(x=>x.trim()).filter(Boolean),
-    rag_k:Number($("#set-ragk").value||3)
+    rag_k:Number($("#set-ragk").value||3),
+    workspace:$("#set-workspace").value.trim()
   };
   const r=await post("/api/settings",body);
   st.textContent=r.ok?"✓ 已保存并即时生效":"✗ "+(r.error||"失败");
@@ -682,6 +938,7 @@ async function resetSettings(){
 $("#page-settings")&&0; /* 占位 */
 
 /* ---------- RAG ---------- */
+/* RAG 检索：有关键词=余弦相似检索，留空=最近轨迹 */
 async function ragQuery(){
   const q=$("#rag-q").value.trim();
   const d=await fetch("/api/rag?q="+encodeURIComponent(q)+"&k=5").then(r=>r.json());
@@ -694,6 +951,8 @@ async function ragQuery(){
 }
 
 initTools();
+loadRuns();
+loadChatHistory();
 loadLLM();
 loadSMTP();
 loadSettings();

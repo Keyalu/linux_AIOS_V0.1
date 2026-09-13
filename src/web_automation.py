@@ -29,9 +29,11 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import llm_client
 from .interfaces import (PermissionLevel, ToolParam, ToolParamType,
                          ToolSchema)
 
@@ -185,17 +187,28 @@ class WebAutomation:
 
     def _ensure_locked(self, url: str = "") -> None:
         if self._ws is not None:
-            return                               # 已连接命令通道
+            # 连接探活：浏览器被关闭/崩溃后 _ws 残留为死连接，操作必然失败
+            # 降级 —— 探活失败即关闭死连接并重连/重启（自愈而非报错）
+            try:
+                self._cmd("Runtime.evaluate",
+                          {"expression": "1", "returnByValue": True})
+                return
+            except CDPError:
+                self.close()
+                if self._reachable():
+                    self._connect()
+                    return
         if not self._reachable():
             binary = self._binary()
             if not binary:
                 raise CDPError("未找到 Chromium 系浏览器（chromium/chrome）")
             _PROFILE_DIR.parent.mkdir(parents=True, exist_ok=True)
+            # 启动参数不带 url：带 url 会先开一个"启动页"，随后自动化
+            # 标签页再导航同一地址 —— 同一页面被打开两遍（实测 bug）。
+            # 统一由 open_url 经 Page.navigate 在自动化标签页里打开。
             args = [binary, f"--remote-debugging-port={self._port}",
                     f"--user-data-dir={_PROFILE_DIR}",
                     "--no-first-run", "--no-default-browser-check"]
-            if url:
-                args.append(url)
             try:
                 subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL,
@@ -231,6 +244,32 @@ class WebAutomation:
         if self._ws is not None:
             self._ws.close()
             self._ws = None
+
+    def close_browser(self) -> dict:
+        """CDP Browser.close 优雅关闭自动化浏览器。
+
+        这是关闭 snap Chromium 的唯一可靠方式：pkill 在本环境被
+        AppArmor 拒绝（权限不够）。幂等：浏览器未运行也返回成功。"""
+        if not self._reachable():
+            self.close()
+            return {"closed": True, "note": "浏览器本就未在运行"}
+        v = _http_json(f"http://127.0.0.1:{self._port}/json/version", 3)
+        ws = _WebSocket(v["webSocketDebuggerUrl"])
+        try:
+            ws.send_text(json.dumps({"id": 1, "method": "Browser.close"}))
+            try:
+                ws.recv_text()                      # 应答可能随断连丢失
+            except Exception:
+                pass
+        finally:
+            ws.close()
+        self.close()
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if not self._reachable():
+                return {"closed": True}
+            time.sleep(0.3)
+        return {"closed": False, "note": "关闭命令已发出但端口仍在，稍后自动退出"}
 
     # -------------------------------------------------- CDP 命令 --
     def _cmd(self, method: str, params: dict | None = None,
@@ -276,6 +315,18 @@ class WebAutomation:
             except Exception:
                 pass
             time.sleep(0.4)
+        # 关掉启动残留的空白标签页（浏览器冷启动默认页 + 历史自动化页），
+        # 保持窗口里只有正在使用的页面
+        try:
+            for t in _http_json(f"http://127.0.0.1:{self._port}/json", 3):
+                if (t.get("type") == "page" and t.get("id") != self._target_id
+                        and str(t.get("url", ""))
+                        .startswith(("chrome://newtab", "about:blank"))):
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{self._port}/json/close/{t['id']}",
+                        timeout=2)
+        except Exception:
+            pass                        # 清理失败不影响打开页面本身
         return self.state()
 
     def find(self, text: str = "", selector: str = "") -> dict | None:
@@ -304,29 +355,95 @@ class WebAutomation:
         raw = r.get("result", {}).get("value")
         return json.loads(raw) if raw else None
 
-    def click(self, text: str = "", selector: str = "", retries: int = 3,
-              interval: float = 0.6) -> dict:
+    def _nth_result(self, n: int) -> dict | None:
+        """取搜索结果页的第 n 条自然结果链接（各引擎容器逐级探测）。"""
+        js = (
+            "JSON.stringify((()=>{"
+            f"const n={max(1, int(n))};"
+            "const sels=['#b_results li a[href]','#search a[href]',"
+            "'.results a[href]','main a[href]'];"
+            "let links=[];"
+            "for(const s of sels){"
+            "links=[...document.querySelectorAll(s)].filter(a=>{"
+            "const h=a.href||'';return h.startsWith('http')"
+            "&&!h.includes(location.hostname)&&(a.innerText||'').trim().length>3;});"
+            "if(links.length>=n)break;}"
+            "const a=links[n-1];if(!a)return null;"
+            "a.scrollIntoView({block:'center'});"
+            "const r=a.getBoundingClientRect();"
+            "return {tag:'a',text:(a.innerText||'').trim().slice(0,60),"
+            "href:a.href,x:r.x+r.width/2,y:r.y+r.height/2};})())"
+        )
+        r = self._cmd("Runtime.evaluate", {"expression": js,
+                                           "returnByValue": True})
+        raw = r.get("result", {}).get("value")
+        return json.loads(raw) if raw else None
+
+    def click(self, text: str = "", selector: str = "", nth: int | None = None,
+              retries: int = 3, interval: float = 0.6) -> dict:
         """定位并点击页面元素（真实输入事件）。
 
+        nth：点击搜索结果页的第 n 条自然结果（"点击第一条结果"专用）；
+        text/selector：按可见文本/CSS 选择器定位。
         retries：页面异步渲染时元素可能晚到，未命中短暂轮询再判失败。"""
         self._ensure_locked()
         el = None
-        for attempt in range(max(1, retries)):
-            el = self.find(text=text, selector=selector)
-            if el is not None:
-                break
-            if attempt + 1 < retries:
-                time.sleep(interval)
+        if nth is not None:
+            for attempt in range(max(1, retries)):
+                el = self._nth_result(int(nth))
+                if el is not None:
+                    break
+                if attempt + 1 < retries:
+                    time.sleep(interval)
+        else:
+            for attempt in range(max(1, retries)):
+                el = self.find(text=text, selector=selector)
+                if el is not None:
+                    break
+                if attempt + 1 < retries:
+                    time.sleep(interval)
         if el is None:
             raise _NotFoundError(
-                f"网页中未找到元素: text={text!r} selector={selector!r}")
+                f"网页中未找到元素: text={text!r} selector={selector!r} nth={nth!r}")
+        before_ids = self._page_ids()
         common = {"x": el["x"], "y": el["y"], "button": "left"}
         for params in ({"type": "mouseMoved", **common},
                        {"type": "mousePressed", "clickCount": 1,
                         "buttons": 1, **common},
                        {"type": "mouseReleased", "clickCount": 1, **common}):
             self._cmd("Input.dispatchMouseEvent", params)
+        # 链接常以 target=_blank 新标签打开：新页面出现后把自动化目标
+        # 切过去（后续操作与状态读取跟随实际页面）
+        el["opened_new_tab"] = self._adopt_new_tab(before_ids)
         return el
+
+    def _page_ids(self) -> set:
+        try:
+            return {t.get("id") for t in
+                    _http_json(f"http://127.0.0.1:{self._port}/json", 3)
+                    if t.get("type") == "page"}
+        except Exception:
+            return set()
+
+    def _adopt_new_tab(self, before_ids: set, tries: int = 4,
+                       interval: float = 0.5) -> bool:
+        """点击打开的新标签页出现后，把自动化命令通道切到该页。"""
+        for _ in range(tries):
+            try:
+                pages = [t for t in _http_json(
+                    f"http://127.0.0.1:{self._port}/json", 3)
+                    if (t.get("type") == "page"
+                        and t.get("id") not in before_ids
+                        and t.get("webSocketDebuggerUrl"))]
+            except Exception:
+                pages = []
+            if pages:
+                self.close()
+                self._target_id = pages[0]["id"]
+                self._ws = _WebSocket(pages[0]["webSocketDebuggerUrl"])
+                return True
+            time.sleep(interval)
+        return False
 
     def state(self) -> dict:
         """当前页面 {url, title}（效果验证与审计用）。"""
@@ -335,6 +452,24 @@ class WebAutomation:
             "expression": "JSON.stringify({url:location.href,"
                           "title:document.title})",
             "returnByValue": True})
+        return json.loads(r["result"]["value"])
+
+    def web_extract(self, max_chars: int = 3500) -> dict:
+        """抽取当前页面：URL/标题/正文（截断）/前 20 个链接，供 LLM 解读。"""
+        self._ensure_locked()
+        js = (
+            "JSON.stringify((()=>{"
+            f"const max={int(max_chars)};"
+            "const t=(document.body?document.body.innerText:'')"
+            ".replace(/\\n{3,}/g,'\\n\\n');"
+            "const links=[...document.querySelectorAll('a[href]')]"
+            ".map(a=>({text:(a.innerText||'').trim().slice(0,60),href:a.href}))"
+            ".filter(l=>l.text&&l.text.length>1).slice(0,20);"
+            "return {url:location.href,title:document.title,"
+            "text:t.slice(0,max),links:links};})())"
+        )
+        r = self._cmd("Runtime.evaluate", {"expression": js,
+                                           "returnByValue": True})
         return json.loads(r["result"]["value"])
 
 
@@ -373,21 +508,23 @@ def web_open(url: str) -> dict:
                 "error": f"web_open 失败: {type(e).__name__}: {e}"}
 
 
-def web_click(text: str = "", selector: str = "") -> dict:
-    """点击网页元素（按可见文本子串或 CSS 选择器定位）。"""
+def web_click(text: str = "", selector: str = "", nth=None) -> dict:
+    """点击网页元素：按可见文本/CSS 选择器定位，或点搜索结果第 n 条。"""
+    nth_v = int(nth) if str(nth or "").strip() else None
     if not (isinstance(text, str) and text.strip()) \
-            and not (isinstance(selector, str) and selector.strip()):
+            and not (isinstance(selector, str) and selector.strip()) \
+            and nth_v is None:
         return {"success": False,
-                "error": "参数错误: text / selector 至少提供一个"}
+                "error": "参数错误: text / selector / nth 至少提供一个"}
     try:
         auto = get_automation()
         before = auto.state()
-        el = auto.click(text=text.strip(), selector=selector.strip())
+        el = auto.click(text=text.strip(), selector=selector.strip(), nth=nth_v)
         time.sleep(0.6)                       # 等页面响应跳转/渲染
         after = auto.state()
         return {"success": True,
                 "result": {"clicked": el.get("text") or selector,
-                           "tag": el.get("tag", ""),
+                           "tag": el.get("tag", ""), "href": el.get("href", ""),
                            "before": before, "after": after}}
     except _NotFoundError as e:
         return {"success": False, "error": str(e)}   # 浏览器活着，是真没找到
@@ -414,7 +551,111 @@ def web_state() -> dict:
                 "error": f"web_state 失败: {type(e).__name__}: {e}"}
 
 
+def web_extract(max_chars: int = 3500) -> dict:
+    """抽取自动化浏览器当前页面的正文与链接（供 llm_answer 解读）。"""
+    try:
+        data = get_automation().web_extract(max_chars=int(max_chars or 3500))
+        return {"success": True, "result": data}
+    except CDPError as e:
+        return {"success": True, "result": f"[Mock] web_extract — {e}",
+                "simulated": True}
+    except Exception as e:
+        return {"success": False,
+                "error": f"web_extract 失败: {type(e).__name__}: {e}"}
+
+
+def web_close_browser() -> dict:
+    """优雅关闭自动化浏览器（CDP Browser.close；幂等）。"""
+    try:
+        r = get_automation().close_browser()
+        note = r.get("note", "")
+        return {"success": True,
+                "result": "自动化浏览器已关闭" + (f"（{note}）" if note else "")}
+    except Exception as e:
+        return {"success": False,
+                "error": f"关闭浏览器失败: {type(e).__name__}: {e}"}
+
+
+def llm_answer(question: str = "", text: str = "") -> dict:
+    """把工具输出/文本交给 LLM 解读：回答问题或总结（配置与组1 同源）。"""
+    q = (question or "").strip()
+    t = (text or "").strip()
+    if not q and not t:
+        return {"success": False,
+                "error": "参数错误: question / text 至少提供一个"
+                         "（总结上一步输出时 text 通常写 {{prev_result}}）"}
+    if t in ("(无上一步结果)", "(引用的步骤不存在)"):
+        t = ""                                # 占位空值 → 纯问题模式
+    sys_p = ("你是 Linux Agentic OS 的结果解读助手。基于给出的参考数据"
+             "用简洁中文回答；参考数据里没有的信息不要编造。")
+    user_p = (f"用户问题：{q}\n\n参考数据：\n{t[:6000]}") if t else q
+    answer = llm_client.chat(user_p, sys_p)
+    if answer is None:
+        return {"success": False,
+                "error": "LLM 调用失败：未配置 Key 或网络不可用（LLM 设置页检查）"}
+    return {"success": True,
+            "result": {"question": q or "(总结)", "answer": answer}}
+
+
+def web_search(query: str, engine: str = "bing") -> dict:
+    """在自动化浏览器中打开搜索引擎结果页（要拿结果内容当数据用 mcp_search）。"""
+    if not isinstance(query, str) or not query.strip():
+        return {"success": False, "error": "参数错误: query 不能为空"}
+    q = urllib.parse.quote(query.strip())
+    url = {"baidu": f"https://www.baidu.com/s?wd={q}"}.get(
+        (engine or "bing").lower(), f"https://www.bing.com/search?q={q}")
+    try:
+        st = get_automation().open_url(url)
+        return {"success": True,
+                "result": {"query": query.strip(), "engine": engine, **st}}
+    except CDPError as e:
+        return {"success": True,
+                "result": f"[Mock] web_search({query!r}) — {e}",
+                "simulated": True}
+    except Exception as e:
+        return {"success": False,
+                "error": f"web_search 失败: {type(e).__name__}: {e}"}
+
+
 WEB_SCHEMAS: dict[str, ToolSchema] = {
+    "web_extract": ToolSchema(
+        name="web_extract",
+        description="抽取自动化浏览器当前页面的正文与链接（配合 llm_answer "
+                    "实现\"打开网页并总结/回答\"类任务）",
+        parameters=[ToolParam("max_chars", ToolParamType.NUMBER,
+                              "正文最多抽取字符数", required=False, default=3500)],
+        permission=PermissionLevel.PUBLIC,
+    ),
+    "web_close_browser": ToolSchema(
+        name="web_close_browser",
+        description="优雅关闭自动化浏览器（CDP Browser.close，幂等）。"
+                    "不要用 run_command 跑 pkill 关浏览器——snap 进程会被拒绝",
+        parameters=[],
+        permission=PermissionLevel.PUBLIC,
+    ),
+    "llm_answer": ToolSchema(
+        name="llm_answer",
+        description="把工具输出交给 LLM 解读：回答问题或生成摘要。"
+                    "总结上一步输出时 text 写 {{prev_result}}",
+        parameters=[
+            ToolParam("question", ToolParamType.STRING, "用户的问题（可为空=纯总结）",
+                      required=False, default=""),
+            ToolParam("text", ToolParamType.STRING, "待解读的文本（通常 {{prev_result}}）",
+                      required=False, default=""),
+        ],
+        permission=PermissionLevel.PUBLIC,
+    ),
+    "web_search": ToolSchema(
+        name="web_search",
+        description="在自动化浏览器中打开搜索引擎结果页（默认 Bing，可 baidu）；"
+                    "要拿搜索结果的内容当数据用 mcp_search",
+        parameters=[
+            ToolParam("query", ToolParamType.STRING, "搜索关键词"),
+            ToolParam("engine", ToolParamType.STRING, "搜索引擎：bing（默认）/baidu",
+                      required=False, default="bing"),
+        ],
+        permission=PermissionLevel.PUBLIC,
+    ),
     "web_open": ToolSchema(
         name="web_open",
         description="在自动化浏览器（独立 profile 的 Chromium）中打开网页并等待"
@@ -430,6 +671,8 @@ WEB_SCHEMAS: dict[str, ToolSchema] = {
             ToolParam("text", ToolParamType.STRING, "元素可见文本（子串匹配）"),
             ToolParam("selector", ToolParamType.STRING, "CSS 选择器（可选，提供时优先）",
                       required=False, default=""),
+            ToolParam("nth", ToolParamType.NUMBER, "点击搜索结果第 n 条（与 web_search 配套）",
+                      required=False, default=None),
         ],
         permission=PermissionLevel.PUBLIC,
     ),
@@ -443,8 +686,10 @@ WEB_SCHEMAS: dict[str, ToolSchema] = {
 
 
 def register_web_tools(registry) -> None:
-    """把 web_open/web_click/web_state 注册进 ToolRegistry（幂等）。"""
-    for name, func in (("web_open", web_open), ("web_click", web_click),
-                       ("web_state", web_state)):
+    """把 web/answer 系工具注册进 ToolRegistry（幂等）。"""
+    for name, func in (("web_search", web_search), ("web_open", web_open),
+                       ("web_click", web_click), ("web_state", web_state),
+                       ("web_extract", web_extract), ("llm_answer", llm_answer),
+                       ("web_close_browser", web_close_browser)):
         registry.register(name, func, WEB_SCHEMAS.get(name))
 

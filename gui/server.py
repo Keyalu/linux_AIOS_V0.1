@@ -22,6 +22,7 @@ import sys
 import threading
 import uuid
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -72,6 +73,7 @@ SETTINGS_DEFAULT = {
     "action_delay": 0.3,          # GUI 动作间隔秒
     "protected_extra": [],        # 追加受保护路径
     "rag_k": 3,                   # RAG 默认返回条数
+    "workspace": "",              # 默认工作区（空 = system_out/demo_task）
 }
 
 
@@ -96,6 +98,7 @@ def save_settings(s: dict) -> None:
 
 def apply_settings(s: dict) -> None:
     """把设置安全地应用到在跑模块（逐项容错，坏值不影响系统）。"""
+    # 目标是"在跑的模块实例"：热更新立即生效，无需重启服务
     host = SYSTEM.modules[1]
     agent = SYSTEM.modules[3]
     planner = SYSTEM.modules[2]
@@ -131,14 +134,27 @@ def apply_settings(s: dict) -> None:
         security.add_protected(extra)
     except Exception:
         pass
+    try:
+        # 默认工作区：文件操作（整理/备份/保存/打开目录）归一层的锚点。
+        # 空值回落 system_out/demo_task；设置即时生效并自动创建目录
+        ws = os.path.expanduser(str(s.get("workspace") or "").strip())
+        if ws:
+            os.makedirs(ws, exist_ok=True)
+            SYSTEM.default_target = ws
+        else:
+            SYSTEM.default_target = os.path.join(OUT, "demo_task")
+    except Exception:
+        pass
 
 
 SYSTEM = build_system()
 
 # ── SMTP 配置持久化：重启后邮件服务默认可用 ──
 SMTP_CONFIG_PATH = os.path.join(OUT, "smtp_config.json")
+CHAT_HISTORY_PATH = os.path.join(OUT, "chat_history.json")
 
 
+# 启动时把持久化的 SMTP 凭据灌进环境变量（send_email 真实发送时兜底读取）
 def load_smtp_config() -> None:
     try:
         with open(SMTP_CONFIG_PATH, encoding="utf-8") as f:
@@ -163,15 +179,19 @@ def _emit(run: dict, stage: str, **data) -> None:
 
 
 def _start_run(text: str = None, confirm_mode: str = "auto",
-               staged: dict | None = None) -> str:
+               staged: dict | None = None, source: str = "console") -> str:
     """启动一次编排运行。
 
     staged 给定（用户已确认的方案）时直接执行该方案，零重新规划、
     零 LLM 调用 —— 用户确认的方案 = 实际执行的方案；
     staged 为空（无需确认的低风险指令）时在线程内先 plan_only。
     """
+    # 每次运行一个 run_id：前端凭它轮询事件流
     rid = uuid.uuid4().hex[:8]
-    run = {"id": rid, "status": "running", "events": [], "bundle": None}
+    run = {"id": rid, "status": "running", "events": [], "bundle": None,
+           "text": text or (staged or {}).get("text", ""),
+           "source": source, "time": time.strftime("%H:%M:%S"),
+           "verdict": None, "summary": None}
     with RUNS_LOCK:
         RUNS[rid] = run
     if len(RUNS) > 50:                     # 只保留最近 50 次运行
@@ -179,6 +199,7 @@ def _start_run(text: str = None, confirm_mode: str = "auto",
             if RUNS[old]["status"] != "running":
                 RUNS.pop(old, None)
 
+    # 编排线程：plan_only（或直接执行已确认的 staged 方案）→ execute_approved → 事件回传
     def worker():
         try:
             with _LOCK:
@@ -199,6 +220,7 @@ def _start_run(text: str = None, confirm_mode: str = "auto",
                     if st.get("rejected"):
                         run["status"] = "rejected"
                         run["bundle"] = st
+                        run["verdict"] = "拦截"
                         _emit(run, "rejected", reason=st["rejected"])
                         return
                     _emit(run, "plan", steps=len(st["plan"].get("steps", [])))
@@ -212,6 +234,8 @@ def _start_run(text: str = None, confirm_mode: str = "auto",
             bundle["stats_detail"] = stats_payload()
             run["bundle"] = bundle
             run["status"] = "done"
+            run["verdict"] = bundle["audit"]["verdict"]
+            run["summary"] = bundle["session"]["summary"]
             _emit(run, "done", verdict=bundle["audit"]["verdict"])
         except Exception as e:
             run["status"] = "failed"
@@ -322,6 +346,22 @@ class Handler(BaseHTTPRequestHandler):
                 "api_key_masked": (key[:4] + "****" + key[-4:]) if len(key) > 8 else ("已配置" if key else ""),
                 "use_llm": host.use_llm, "last_engine": host.last_engine,
             })
+        elif self.path == "/api/runs":
+            # 运行历史：编排控制台与对话助手发起的执行都在 RUNS 登记过
+            with RUNS_LOCK:
+                runs = [{k: r.get(k) for k in
+                         ("id", "time", "source", "text", "status",
+                          "verdict", "summary")}
+                        for r in reversed(list(RUNS.values()))]
+            self._json({"runs": runs})
+        elif self.path == "/api/chat_history":
+            try:
+                with open(CHAT_HISTORY_PATH, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                data = {"messages": []}
+            self._json({"messages": data.get("messages", [])[-100:],
+                        "updated": data.get("updated")})
         elif self.path == "/api/smtp_config":
             key = os.environ.get("SMTP_PASS", "")
             self._json({"configured": bool(os.environ.get("SMTP_HOST")),
@@ -365,7 +405,70 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"服务端异常: {type(e).__name__}: {e}"}, 500)
 
     def _route_post(self, body: dict):
-        if self.path == "/api/orchestrate":
+        if self.path == "/api/chat":
+            # 对话助手：输入直连 LLM 厂商，SSE 逐段转发给前端（流式优先，
+            # 厂商异常时降级为一次性返回）。不占编排锁 —— 长对话不阻塞编排。
+            msgs = [{"role": str(m.get("role", "user")),
+                     "content": str(m.get("content", ""))[:4000]}
+                    for m in (body.get("messages") or [])
+                    if isinstance(m, dict) and m.get("content")][-16:]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.end_headers()
+
+            def emit(obj):
+                self.wfile.write(
+                    f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
+            # 操作路由：确定性规则识别系统操作意图（零 token）。命中则发
+            # route 事件，由前端出执行卡片、用户点击后才走完整编排管线；
+            # 未命中继续走 LLM 对话。
+            last_user = next((m["content"] for m in reversed(msgs)
+                              if m.get("role") == "user"), "")
+            try:
+                op = SYSTEM.modules[1].detect_operation(last_user)
+            except Exception:
+                op = None
+            if op:
+                emit({"route": "operation", "user_text": last_user,
+                      "actions": [g.get("action") for g in op.get("goals", [])]})
+                emit({"done": True})
+                return
+            # 规则命中了操作词但被保守门拦下（长/复杂指令）→ 引导去编排
+            # 控制台：那里的 LLM 规划 + 确认流才是复杂任务的正确入口
+            try:
+                rule_goals = SYSTEM.modules[1]._rule_intent(last_user).get("goals", [])
+            except Exception:
+                rule_goals = []
+            if rule_goals:
+                emit({"route": "complex",
+                      "actions": [g.get("action") for g in rule_goals]})
+                emit({"done": True})
+                return
+            try:
+                from src.llm_client import chat_stream
+                for delta in chat_stream(
+                        [{"role": "system", "content":
+                          "你是 Agent_OS 系统控制台的对话助手，"
+                          "用简洁中文回答。"}] + msgs):
+                    emit({"delta": delta})
+                emit({"done": True})
+            except Exception as e:
+                # 流式失败 → 一次性降级（chat_once 无配置返回 None 也如实报错）
+                try:
+                    from src.llm_client import chat_once
+                    text = chat_once(msgs)
+                    if text:
+                        emit({"delta": text})
+                        emit({"done": True})
+                    else:
+                        emit({"error": f"LLM 调用失败: {type(e).__name__}: {e}"})
+                        emit({"done": True})
+                except Exception as e2:
+                    emit({"error": f"对话失败: {type(e2).__name__}: {e2}"})
+                    emit({"done": True})
+        elif self.path == "/api/orchestrate":
             # 兼容路由：供未强刷的旧缓存页面使用（同步返回完整结果包）
             text = str(body.get("user_text") or "").strip()
             if not text:
@@ -383,6 +486,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(bundle)
         elif self.path == "/api/plan":
             text = str(body.get("user_text") or "").strip()
+            source = str(body.get("source") or "console")
             if not text:
                 self._json({"ok": False, "rejected": "指令不能为空"})
                 return
@@ -397,24 +501,29 @@ class Handler(BaseHTTPRequestHandler):
                 # 存储完整已批准方案：确认后原样执行，不再二次规划
                 PENDING[token] = {"text": text, "time": time.strftime("%H:%M:%S"),
                                   "intent": staged["intent"], "plan": staged["plan"],
-                                  "check": staged["check"]}
+                                  "check": staged["check"], "source": source}
                 self._json({"ok": True, "pending": True, "token": token,
                             "intent": staged["intent"], "plan": staged["plan"],
                             "check": staged["check"],
+                            "degraded": staged.get("degraded", False),
                             "admin_steps": staged["admin_steps"],
                             "real_send_steps": staged["real_send_steps"]})
                 return
-            rid = _start_run(text, confirm_mode="auto")
+            rid = _start_run(text, confirm_mode="auto", source=source)
             self._json({"ok": True, "pending": False, "run_id": rid})
         elif self.path == "/api/execute":
+            # /api/execute：凭确认令牌取出 PENDING 里存好的完整方案原样执行，
             token = str(body.get("token", ""))
             if token not in PENDING:
                 self._json({"error": "确认令牌无效或已过期"}, 404)
                 return
             info = PENDING.pop(token)
             mode = "deny" if str(body.get("mode", "full")) == "safe" else "auto"
-            rid = _start_run(confirm_mode=mode, staged=info)   # 原样执行已确认方案
+            rid = _start_run(confirm_mode=mode, staged=info,
+                             source=str(body.get("source")
+                                        or info.get("source") or "console"))
             self._json({"ok": True, "run_id": rid, "mode": mode})
+        # /api/run：前端每 800ms 带 cursor 增量拉事件流（只回新增事件）
         elif self.path.startswith("/api/run"):
             from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
@@ -464,6 +573,7 @@ class Handler(BaseHTTPRequestHandler):
                 v = str(body.get(body_key, "")).strip()
                 if v:
                     cfg[k] = v
+            # 授权码留空视为沿用旧值（前端不回显明文）
             if not cfg.get("SMTP_HOST") or not cfg.get("SMTP_USER"):
                 self._json({"ok": False, "error": "host 与 user 必填"})
                 return
@@ -484,6 +594,20 @@ class Handler(BaseHTTPRequestHandler):
             r = send_email(to=to, subject="Agent_OS_v1.0 SMTP 测试",
                            body="这是一封连通性测试邮件。", dry_run=False)
             self._json(r)
+        # /api/call：工具台以指定身份直接调用单个工具（真实闸门+统计）
+        elif self.path == "/api/chat_save":
+            # 聊天记录持久化（system_out/chat_history.json，保留最近 100 条）
+            msgs = [m for m in (body.get("messages") or [])
+                    if isinstance(m, dict)
+                    and str(m.get("content", "")).strip()][-100:]
+            try:
+                with open(CHAT_HISTORY_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"messages": msgs,
+                               "updated": datetime.now().isoformat()},
+                              f, ensure_ascii=False, indent=2)
+                self._json({"ok": True})
+            except OSError as e:
+                self._json({"ok": False, "error": str(e)})
         elif self.path == "/api/call":
             name = str(body.get("name", ""))
             params = body.get("params") or {}
@@ -494,12 +618,14 @@ class Handler(BaseHTTPRequestHandler):
             with _LOCK:
                 result = SYSTEM.modules[3].registry.call(name, params, level)
             self._json({"result": result.to_dict()})
+        # /api/skill：工具台调用 Skill（技能与工具分接口）
         elif self.path == "/api/skill":
             name = str(body.get("name", ""))
             params = body.get("params") or {}
             with _LOCK:
                 result = SYSTEM.modules[3].skills.call_skill(name, params)
             self._json({"result": result.to_dict()})
+        # /api/settings：以持久文件为底吸收提交字段 → 逐项钳位 → 热更新应用
         elif self.path == "/api/settings":
             with _LOCK:
                 s = load_settings()          # 以持久文件为底，吸收本次提交的字段

@@ -58,6 +58,7 @@ class BufferedToolStats(IToolStats):
         if record.error:
             entry["error"] = record.error
 
+        # 锁内完成：明细环形截断 + 聚合计数 + 待落盘缓冲 + 阈值判断
         with self._lock:
             self._records.append(entry)
             if len(self._records) > self._max_records:

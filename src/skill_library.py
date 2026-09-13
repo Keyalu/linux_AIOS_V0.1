@@ -57,6 +57,9 @@ class SkillLibrary(ISkillLibrary):
             self._schemas[name] = ToolSchema(name=name, description=f"Skill: {name}")
 
     def call_skill(self, name: str, params: dict[str, Any] | None = None) -> ToolResult:
+        """调用一个 Skill：执行并按统一契约规整返回值（与 ToolRegistry 一致）。"""
+        params = params or {}
+    def call_skill(self, name: str, params: dict[str, Any] | None = None) -> ToolResult:
         params = params or {}
         if name not in self._skills:
             return ToolResult.fail(f"Skill 未注册: {name}")
@@ -65,9 +68,15 @@ class SkillLibrary(ISkillLibrary):
                 f"参数错误: params 必须是字典，收到 {type(params).__name__}"
             )
         try:
+            # 执行：返回值规整约定与 ToolRegistry.call 相同（dict 带 success / 裸值）
             raw = self._skills[name](**params)
             if isinstance(raw, dict) and "success" in raw:
-                return ToolResult(**raw) if raw["success"] else ToolResult.fail(raw.get("error", ""))
+                return (ToolResult(success=bool(raw["success"]),
+                                   result=raw.get("result"),
+                                   error=raw.get("error"),
+                                   extra={k: v for k, v in raw.items()
+                                          if k not in ("success", "result", "error")})
+                        if raw["success"] else ToolResult.fail(raw.get("error", "")))
             return ToolResult.ok(raw)
         except Exception as e:
             return ToolResult.fail(f"Skill 执行异常: {type(e).__name__}: {e}")
@@ -111,6 +120,7 @@ class SkillLibrary(ISkillLibrary):
                 ToolParam("path", ToolParamType.STRING, "路径", required=False, default="/"),
             ]),
         ]
+        # 约定：每个 Skill 的实现就是同类内 _<name> 方法，按名反射取得
         for name, desc, params in skills:
             func = getattr(self, f"_{name}")
             self.register_skill(name, func, ToolSchema(name=name, description=desc, parameters=params))
@@ -207,6 +217,7 @@ class SkillLibrary(ISkillLibrary):
         import subprocess
         import platform
 
+        # 磁盘：根分区用量
         usage = shutil.disk_usage("/")
         disk = {
             "total_gb": round(usage.total / (1024**3), 1),
@@ -215,6 +226,7 @@ class SkillLibrary(ISkillLibrary):
             "percent": round(usage.used / usage.total * 100, 1),
         }
 
+        # 内存：读 /proc/meminfo（Linux 专属；读不到则注明错误而非失败）
         mem = {}
         try:
             with open("/proc/meminfo") as f:
@@ -226,6 +238,7 @@ class SkillLibrary(ISkillLibrary):
         except Exception:
             mem = {"error": "无法读取 /proc/meminfo"}
 
+        # 进程数：/proc 下每个数字目录就是一个进程
         try:
             proc_count = len(os.listdir("/proc"))
         except Exception:
@@ -257,6 +270,7 @@ class SkillLibrary(ISkillLibrary):
                         "size": p.stat().st_size,
                         "suffix": p.suffix,
                     })
+                # 限额保护：目录巨大时最多收集 100 个结果
                 if len(matches) >= 100:
                     break
         except PermissionError:
@@ -284,6 +298,7 @@ class SkillLibrary(ISkillLibrary):
         if prot:
             return {"success": False, "error": f"拒绝清理受保护路径: {base} ({prot})"}
 
+        # 只清理 mtime 早于截止时间的文件（默认保留 7 天）
         cutoff = time.time() - max_age_days * 86400
         removed = []
         errors = []
@@ -314,6 +329,7 @@ class SkillLibrary(ISkillLibrary):
         src_p = Path(src).expanduser().resolve()
         if not src_p.exists():
             return {"success": False, "error": f"源路径不存在: {src_p}"}
+        # dest 缺省时按时间戳派生，避免覆盖旧备份
         if dest is None:
             ts = time.strftime("%Y%m%d_%H%M%S")
             dest = f"{src_p}_{ts}_backup"
