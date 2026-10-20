@@ -18,6 +18,25 @@ class AIShell:
         self.host_agent = host_agent
         self.coordinator = coordinator
         self.history: list[dict] = []          # 持久性：会话历史（可落盘）
+        # 交互式 Shell：把提权确认接到真人（AppAgent 缺省 confirmer=None 表示
+        # 无人值守；交互场景必须真的问一次，否则"确认流"是空壳）
+        agent = getattr(coordinator, "modules", {}).get(3) if coordinator else None
+        if agent is not None and getattr(agent, "confirmer", None) is None:
+            try:
+                agent.confirmer = self._confirm_escalation
+            except Exception:
+                pass
+
+    @staticmethod
+    def _confirm_escalation(info: dict) -> bool:
+        """提权确认：交互环境问用户；无 stdin/被中断一律视为拒绝（安全优先）。"""
+        try:
+            ans = input(f"\n[提权确认] 工具 {info.get('tool')} 需要 "
+                        f"{info.get('to')} 权限（当前 {info.get('from')}）。"
+                        f"同意本次提权重试？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("y", "yes")
 
     # ---------------------------------------------------------- --
     def run(self) -> None:

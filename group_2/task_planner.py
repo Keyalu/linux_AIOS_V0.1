@@ -13,19 +13,19 @@ requires_admin, description}], "elements": {引用的元素}, "policy": 短码,
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import uuid
 
 from .route_policy import apply_route_policy
+# 优化方案 1.3：规划映射表由 src/capabilities 单一命名空间派生（红线 17）。
+# 新增动作只在 CAPABILITIES 登记一次，组1 类别/别名与组2 tool/skill 映射
+# 同步生成；一致性由 tests.TestCapabilitySingleSource 守卫。
+from src.capabilities import TOOL_ACTION_MAP as _TOOL_ACTIONS, \
+    SKILL_ACTION_MAP as _SKILL_ACTIONS, GUI_ACTION_NAMES as _GUI_ACTION_NAMES
 
-# intent 动作 → (步骤类别, 组4 公开名)
-_SKILL_ACTIONS = {
-    "organize": "organize_downloads", "find_duplicates": "find_duplicate_files",
-    "backup": "backup_directory", "find_large_files": "find_large_files",
-    "disk_usage": "disk_usage", "system_check": "system_check",
-    "cleanup_temp": "cleanup_temp", "find_files": "find_files",
-}
+# intent 动作 → (步骤类别, 组4 公开名)：_SKILL_ACTIONS / _TOOL_ACTIONS 见上 import
 # 应用控制类 GUI 动作 → GUI 步骤序列（任务书演示场景 1/2/3/5）
 _GUI_ACTIONS = {
     "open_app": "打开应用",
@@ -35,17 +35,38 @@ _GUI_ACTIONS = {
     "create_folder": "创建文件夹",
 }
 
-_TOOL_ACTIONS = {
-    "delete_file": "delete_file", "send_email": "send_email",
-    "open_url": "open_url", "weather": "mcp_weather",
-    "search": "mcp_search", "translate": "mcp_translate",
-    "write_file": "write_file", "run_command": "run_command",
-    "take_screenshot": "take_screenshot",
-    "web_search": "web_search", "web_open": "web_open",
-    "web_click": "web_click", "web_state": "web_state",
-    "web_extract": "web_extract", "answer": "llm_answer",
-    "web_close_browser": "web_close_browser",
+# _TOOL_ACTIONS（intent 动作 → 组4 工具名）由 src.capabilities 派生，见上 import。
+# 审计 #24 教训：这批恒等映射一旦手抄漏项（copy_file/move_file/read_file/
+# list_directory/mcp_search 曾整批缺失），difflib 近似不保证命中，步骤被静默丢弃。
+
+# 缺参兜底白名单：动作 → 它的"工作区主路径参数名"。
+# 只有这些动作在缺参时才接受"用工作区目标填充"。破坏性动作（delete_file）
+# 不在其中——缺 path 就如实报"缺少必需参数"，绝不自动指向工作区
+# （早期实现取 schema 第一个 string 参数填 target，让"删除一个不存在的
+#  路径"变成了"删除整个工作区"）。
+_PATH_FALLBACK = {
+    "organize_downloads": "path",
+    "find_duplicate_files": "path",
+    "find_large_files": "path",
+    "cleanup_temp": "path",
+    "find_files": "directory",
+    "backup_directory": "src",
+    "write_file": "path",
+    "take_screenshot": "path",
 }
+
+
+def _is_pathish(v) -> bool:
+    """填充值是否"像路径"：绝对路径 / ~ 开头 / 相对点开头。
+
+    Windows 盘符（C:\\...）也算绝对路径 —— 早期用
+    startswith(("/", "~", ".")) 判定，在 Windows 上恒不通过，
+    文件类动作整体拿不到路径。
+    """
+    s = str(v or "").strip()
+    if not s:
+        return False
+    return bool(s.startswith(("/", "~", ".")) or os.path.isabs(s))
 
 
 class TaskPlanner:
@@ -65,6 +86,7 @@ class TaskPlanner:
     def plan(self, intent: dict) -> dict:
         steps: list[dict] = []
         unresolved: list[str] = list(intent.get("unresolved", []))
+        base_unresolved = len(unresolved)      # 空计划归因用（见下方 #125 处）
         target = intent.get("target") or "."
         # 多目标：优先遍历组1 的 goals；兼容只填了顶层 action 的旧意图
         goals = intent.get("goals") or []
@@ -78,27 +100,42 @@ class TaskPlanner:
             steps += self._steps_for(goal.get("action", ""), goal, intent,
                                      target, unresolved,
                                      last_file_target=last_file_target)
-            if steps and steps[-1]["kind"] == "skill":
+            if steps:
+                # 记录计划内"最近的文件目标"：不限 kind —— write_file /
+                # take_screenshot 等工具步骤同样能产出后续 backup 的源。
                 p_last = (steps[-1].get("params") or {})
-                last_file_target = p_last.get("path") or p_last.get(
-                    "directory") or last_file_target
+                last_file_target = (p_last.get("path") or p_last.get("directory")
+                                    or p_last.get("dest") or last_file_target)
 
-        if not steps and intent.get("action"):
+        if not steps and intent.get("action") and len(unresolved) == base_unresolved:
+            # 修复逻辑审计（轻微）：此前空计划**总**补一句"动作未映射到组4"，
+            # 真实原因是缺参时 unresolved 里两条自相矛盾（既有"缺少必需参数"
+            # 又有"未能映射"），误导排障。只有确实没有任何逐步归因时才给兜底结论。
             unresolved.append(f"动作 {intent.get('action')} 未能映射到组4 能力清单中的工具")
 
         # 收尾：用一条系统命令汇报完成（演示 USER→ADMIN 提权流）
         if steps and self.add_finale:
             steps.append({
                 "step_id": len(steps) + 1, "kind": "tool", "action": "run_command",
-                "target": "", "params": {"cmd": "echo [plan done]"},
+                "target": "", "params": {"cmd": "echo [plan done]", "sandbox": True},
                 "requires_admin": True, "description": "收尾命令（演示提权流）",
             })
         steps = self.renumber(steps)
 
         # 通道一致性保障（方案一）：LLM/规则选的 action 只是提案，语义近邻组
         # 的通道由决策表 + 计划图消费分析确定性改写（改写留 route_reason）
+        # 经验回流（优化方案 2.1）：experience_path 由组5 以**数据**注入
+        # （duck-typing，同 security_guard 范式；红线 2 不产组间 import）
+        hints = None
+        exp_path = getattr(self, "experience_path", None)
+        if exp_path:
+            try:
+                from src.experience import channel_stats
+                hints = channel_stats(exp_path) or None
+            except Exception:
+                hints = None
         routes = apply_route_policy(intent.get("user_text", ""), steps,
-                                    self._schemas or None)
+                                    self._schemas or None, channel_stats=hints)
 
         return {
             "plan_id": f"plan-{uuid.uuid4().hex[:8]}",
@@ -116,11 +153,18 @@ class TaskPlanner:
     def _steps_for(self, action: str, goal: dict, intent: dict,
                    target: str, unresolved: list[str],
                    last_file_target: str | None = None) -> list[dict]:
-        # goal.params 是组1 LLM 为该目标抽取的专用参数，优先于顶层 params
-        merged = dict(intent)
-        merged["params"] = {**(intent.get("params") or {}),
-                            **(goal.get("params") or {})}
         """单个目标动作 → 0 或多个计划步骤。"""
+        # goal.params 是组1 为该目标抽取的专用参数。
+        # 修复逻辑审计 #1：顶层 params 是**主目标**的抽参（见组1 _rule_intent/
+        # _llm_intent 的"取第一个 goal"口径），无条件与 goal.params 合并会让
+        # 非主目标继承主目标的路径 —— delete_file 这类缺参动作会拿组1 兜底填进
+        # 顶层的 path（=工作区）当删除目标，"整理X再删除临时文件"变成删除工作区。
+        # 现在只有主目标（或无 goals 的旧式意图）才继承顶层参数。
+        goals_list = intent.get("goals") or []
+        is_primary = (not goals_list) or goal is goals_list[0]
+        top_params = (intent.get("params") or {}) if is_primary else {}
+        merged = dict(intent)
+        merged["params"] = {**top_params, **(goal.get("params") or {})}
         if action == "open_app":
             return self._gui_open_app_steps(
                 (intent.get("params") or {}).get("app") or target, unresolved)
@@ -145,6 +189,10 @@ class TaskPlanner:
             return []
         params = self._fill_params(name, schema, target, merged, goal,
                                    last_file_target=last_file_target)
+        if name == "run_command":
+            # 计划生成的系统命令默认进 bubblewrap 沙箱（工具内 bwrap 不可用时
+            # 会在结果里注明降级），不再"裸奔执行"
+            params.setdefault("sandbox", True)
         missing = [k for k in schema.get("inputSchema", {}).get("required", [])
                    if k not in params or params[k] in ("", None)]
         if missing:
@@ -195,26 +243,19 @@ class TaskPlanner:
                 intent.get("user_text", ""))
             if m:
                 params["attachment"] = m if len(m) > 1 else m[0]
-        # 显式参数已覆盖全部必需参数时不再兜底，避免污染无关参数
-        if not params or any(k not in params for k in required):
+        # 缺参兜底：只对"白名单动作的主路径参数"生效，且填充值必须像路径。
+        # 早期实现"取 schema 第一个 string 参数塞 target"：会给 web_click 的
+        # selector 填 "."（非法选择器）、给 delete_file 的 path 填工作区目录。
+        if name in _PATH_FALLBACK and not params.get(_PATH_FALLBACK[name]):
             filler = entity or target
-            if filler:
-                for pname, meta in props.items():
-                    if meta.get("type") == "string" and pname not in params:
-                        # 路径类参数只接受像路径的 filler：文件动作在意图层已
-                        # 经 _resolve_target 成绝对路径；LLM 语义词（如"磁盘"）
-                        # 不像路径就不填，留给工具 default（disk_usage 默认查 /）
-                        if pname in ("path", "src", "directory", "dest") \
-                                and not str(filler).startswith(("/", "~", ".")):
-                            continue
-                        params[pname] = filler
-                        break
-            if name == "backup_directory":
-                src_fb = params.get("src") or (
-                    target if str(target).startswith(("/", "~")) else "") \
-                    or last_file_target or ""
-                params.setdefault("src", src_fb or target)
-                params.setdefault("dest", (src_fb or target).rstrip("/\\") + "_backup")
+            if _is_pathish(filler):
+                params[_PATH_FALLBACK[name]] = filler
+        if name == "backup_directory":
+            src_fb = params.get("src") or (
+                target if str(target).startswith(("/", "~")) else "") \
+                or last_file_target or ""
+            params.setdefault("src", src_fb or target)
+            params.setdefault("dest", (src_fb or target).rstrip("/\\") + "_backup")
         # llm_answer：text 缺省自动接线到上一步输出（消费分析据此把前置
         # 搜索改写为数据通道 mcp_search）；question 由 LLM/规则提供
         if name == "llm_answer":
@@ -234,7 +275,15 @@ class TaskPlanner:
             # 就是一个口语应用名时才路由，避免"我的文件报告"这类长描述误伤
             route = self._known_app_name(name)
             if route:
-                return self._gui_open_app_steps(name, unresolved)
+                steps = self._gui_open_app_steps(name, unresolved)
+                # 修复逻辑审计 #23：通道改写必须留痕。click_element→open_app
+                # 是规划器自己做的确定性改写（不走 route_policy），早期没有
+                # route_reason，审计时看不出"我要点控件，你启动了应用"。
+                for st in steps:
+                    st.setdefault("route_reason",
+                                  f"点击图标「{name}」= 启动应用 → 走 open_app 通道"
+                                  "（X11 dock 不吃合成点击）")
+                return steps
             role = params_in.get("role") or None
             if not name:
                 unresolved.append("未识别要点击的控件名")
@@ -288,6 +337,7 @@ class TaskPlanner:
         "文本编辑器": "gnome-text-editor", "text editor": "gnome-text-editor",
         "图片": "eog", "帮助": "yelp",
         "chrome": "google-chrome", "google-chrome": "google-chrome",
+        "zcode": "zcode",     # 必须排在 code 之前，否则 "zcode" 被 "code" 抢走
         "code": "code", "vscode": "code",
     }
 

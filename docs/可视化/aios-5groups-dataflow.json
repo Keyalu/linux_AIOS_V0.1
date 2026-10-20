@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "AIOS_V0.1 五组数据流转：intent.json → stats.json",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1072,
+      500
+    ],
+    "views": [
+      {
+        "id": "intent-to-plan",
+        "label": "意图 → 安全 → 规划",
+        "focus": [
+          "host_agent",
+          "intent_json",
+          "sandbox",
+          "check_json",
+          "planner",
+          "plan_json"
+        ],
+        "note": "前三段：一句自然语言变成可执行计划；安全闸门不放行就不会进入规划。"
+      },
+      {
+        "id": "execute-and-ledger",
+        "label": "执行与逐笔落账",
+        "focus": [
+          "plan_json",
+          "app_agent",
+          "registry",
+          "stats_json",
+          "session_json"
+        ],
+        "note": "组3 逐步调用组4；每笔调用落进 stats.json，执行结果汇成 session_log.json。"
+      },
+      {
+        "id": "audit-loop",
+        "label": "执行后对账闭环",
+        "focus": [
+          "session_json",
+          "auditor",
+          "audit_json",
+          "stats_json"
+        ],
+        "note": "组5 用 session 逐条结果做两向自比对，再叠加计划步数一致性，产出 verdict。"
+      },
+      {
+        "id": "json-artifacts",
+        "label": "六份中间产物",
+        "focus": [
+          "intent_json",
+          "check_json",
+          "plan_json",
+          "session_json",
+          "audit_json",
+          "stats_json"
+        ],
+        "note": "控制台「中间产物」六个页签直接读这六份文件。"
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "① 组1 意图理解"
+    },
+    {
+      "label": "② 组5 安全检查"
+    },
+    {
+      "label": "③ 组2 任务规划"
+    },
+    {
+      "label": "④ 组3 执行 · 组5 对账"
+    },
+    {
+      "label": "⑤ 组4 工具与账本"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "host_agent",
+      "type": "backend",
+      "label": "组1 HostAgent",
+      "sublabel": "understand_intent",
+      "stage": 0,
+      "row": 0,
+      "width": 112,
+      "tag": "意图理解"
+    },
+    {
+      "id": "intent_json",
+      "type": "database",
+      "label": "intent.json",
+      "sublabel": "goals[] + params",
+      "stage": 0,
+      "row": 1,
+      "width": 112,
+      "tag": "JSON"
+    },
+    {
+      "id": "sandbox",
+      "type": "security",
+      "label": "组5 SecuritySandbox",
+      "sublabel": "check() 四层闸门",
+      "stage": 1,
+      "row": 0,
+      "width": 112,
+      "tag": "安全"
+    },
+    {
+      "id": "check_json",
+      "type": "database",
+      "label": "check.json",
+      "sublabel": "approved / risk",
+      "stage": 1,
+      "row": 1,
+      "width": 112,
+      "tag": "JSON"
+    },
+    {
+      "id": "planner",
+      "type": "backend",
+      "label": "组2 TaskPlanner",
+      "sublabel": "plan() + 控件定位",
+      "stage": 2,
+      "row": 0,
+      "width": 112,
+      "tag": "规划"
+    },
+    {
+      "id": "plan_json",
+      "type": "database",
+      "label": "plan.json",
+      "sublabel": "steps[] + routes",
+      "stage": 2,
+      "row": 1,
+      "width": 112,
+      "tag": "JSON"
+    },
+    {
+      "id": "app_agent",
+      "type": "backend",
+      "label": "组3 AppAgent",
+      "sublabel": "execute_plan()",
+      "stage": 3,
+      "row": 0,
+      "width": 112,
+      "tag": "执行"
+    },
+    {
+      "id": "session_json",
+      "type": "database",
+      "label": "session_log.json",
+      "sublabel": "steps[] + summary",
+      "stage": 3,
+      "row": 1,
+      "width": 112,
+      "tag": "JSON"
+    },
+    {
+      "id": "auditor",
+      "type": "security",
+      "label": "组5 审计对账",
+      "sublabel": "audit() + verdict",
+      "stage": 3,
+      "row": 2,
+      "width": 112,
+      "tag": "审计"
+    },
+    {
+      "id": "registry",
+      "type": "backend",
+      "label": "组4 ToolRegistry",
+      "sublabel": "call() 权限闸门",
+      "stage": 4,
+      "row": 0,
+      "width": 112,
+      "tag": "工具 / 技能"
+    },
+    {
+      "id": "stats_json",
+      "type": "database",
+      "label": "stats.json",
+      "sublabel": "逐笔原子落账",
+      "stage": 4,
+      "row": 1,
+      "width": 112,
+      "tag": "JSON"
+    },
+    {
+      "id": "audit_json",
+      "type": "database",
+      "label": "audit.json",
+      "sublabel": "totals + verdict",
+      "stage": 4,
+      "row": 2,
+      "width": 112,
+      "tag": "JSON"
+    }
+  ],
+  "flows": [
+    {
+      "id": "f1-intent",
+      "from": "host_agent",
+      "to": "intent_json",
+      "label": "intent-xxxx + goals[]",
+      "classification": "组1 产出",
+      "variant": "emphasis",
+      "labelAt": [
+        100,
+        214
+      ]
+    },
+    {
+      "id": "f2-check",
+      "from": "intent_json",
+      "to": "sandbox",
+      "label": "意图 JSON",
+      "classification": "检测面全量展开",
+      "variant": "security",
+      "labelAt": [
+        197,
+        157
+      ]
+    },
+    {
+      "id": "f3-check-out",
+      "from": "sandbox",
+      "to": "check_json",
+      "label": "approved / risk / layer",
+      "classification": "安全判定",
+      "variant": "default",
+      "labelAt": [
+        315,
+        214
+      ]
+    },
+    {
+      "id": "f4-gate",
+      "from": "check_json",
+      "to": "planner",
+      "label": "放行 + 风险",
+      "classification": "未通过即终止",
+      "variant": "security",
+      "labelAt": [
+        412,
+        157
+      ]
+    },
+    {
+      "id": "f5-plan",
+      "from": "planner",
+      "to": "plan_json",
+      "label": "steps[] + routes",
+      "classification": "组2 产出",
+      "variant": "emphasis",
+      "labelAt": [
+        530,
+        214
+      ]
+    },
+    {
+      "id": "f6-exec",
+      "from": "plan_json",
+      "to": "app_agent",
+      "label": "已批准计划",
+      "classification": "批准即执行",
+      "variant": "emphasis",
+      "labelAt": [
+        627,
+        157
+      ]
+    },
+    {
+      "id": "f7-call",
+      "from": "app_agent",
+      "to": "registry",
+      "label": "call() 契约",
+      "classification": "组3 → 组4",
+      "variant": "emphasis",
+      "labelAt": [
+        842,
+        205
+      ]
+    },
+    {
+      "id": "f8-result",
+      "from": "registry",
+      "to": "app_agent",
+      "label": "ToolResult",
+      "classification": "执行回执",
+      "variant": "default",
+      "labelAt": [
+        842,
+        245
+      ]
+    },
+    {
+      "id": "f9-ledger",
+      "from": "registry",
+      "to": "stats_json",
+      "label": "逐笔落账",
+      "classification": "组4 账本",
+      "variant": "dashed",
+      "labelAt": [
+        960,
+        214
+      ]
+    },
+    {
+      "id": "f10-session",
+      "from": "app_agent",
+      "to": "session_json",
+      "label": "session 摘要",
+      "classification": "组3 产出",
+      "variant": "emphasis",
+      "labelAt": [
+        735,
+        214
+      ]
+    },
+    {
+      "id": "f11-audit-in",
+      "from": "session_json",
+      "to": "auditor",
+      "label": "逐条结果",
+      "classification": "对账第 1~2 项",
+      "variant": "emphasis",
+      "labelAt": [
+        745,
+        328
+      ]
+    },
+    {
+      "id": "f13-verdict",
+      "from": "auditor",
+      "to": "audit_json",
+      "label": "consistent + verdict",
+      "classification": "组5 产出",
+      "variant": "emphasis",
+      "labelAt": [
+        900,
+        440
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "主链路与对账口径",
+      "items": [
+        "intent.json → check.json → plan.json →（执行中逐笔累加 stats.json）→ session_log.json → audit.json",
+        "审计 PASS 唯一口径：对账一致 + 全部成功 + 执行步数 > 0；stats.json 不参与对账，它是组4 调用账本",
+        "对账三项：summary.total == 逐条步骤数、summary.success == 逐条成功数、plan.json 计划步数 == 实际执行步数；旁路另有 audit_log.jsonl 与 rag_traces.jsonl"
+      ]
+    }
+  ]
+}

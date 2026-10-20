@@ -11,12 +11,26 @@ Skill = 多个 Tool 的编排组合，实现高级操作。
 """
 
 from __future__ import annotations
-import shutil
 import hashlib
+import os
+import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
 from .interfaces import ISkillLibrary, IToolRegistry, ToolFunc, ToolSchema, ToolResult, ToolParam, ToolParamType
+
+
+def _as_int(value, default: int) -> int:
+    """宽松取整：数值参数可能以字符串形式传入（GUI 表单 / LLM 传参 / 直调）。
+
+    早期实现直接把参数参与算术，收到 "1" 这类字符串会 TypeError
+    （审计复核 V-03）。
+    """
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 class SkillLibrary(ISkillLibrary):
@@ -24,7 +38,6 @@ class SkillLibrary(ISkillLibrary):
     OS Skills 库 — 真实实现。
     内部通过 IToolRegistry 调用底层工具。
     """
-
     # 文件分类规则（综合三个版本）
     FILE_CATEGORIES: dict[str, list[str]] = {
         "文档": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
@@ -59,8 +72,6 @@ class SkillLibrary(ISkillLibrary):
     def call_skill(self, name: str, params: dict[str, Any] | None = None) -> ToolResult:
         """调用一个 Skill：执行并按统一契约规整返回值（与 ToolRegistry 一致）。"""
         params = params or {}
-    def call_skill(self, name: str, params: dict[str, Any] | None = None) -> ToolResult:
-        params = params or {}
         if name not in self._skills:
             return ToolResult.fail(f"Skill 未注册: {name}")
         if not isinstance(params, dict):
@@ -71,18 +82,26 @@ class SkillLibrary(ISkillLibrary):
             # 执行：返回值规整约定与 ToolRegistry.call 相同（dict 带 success / 裸值）
             raw = self._skills[name](**params)
             if isinstance(raw, dict) and "success" in raw:
-                return (ToolResult(success=bool(raw["success"]),
-                                   result=raw.get("result"),
-                                   error=raw.get("error"),
-                                   extra={k: v for k, v in raw.items()
-                                          if k not in ("success", "result", "error")})
-                        if raw["success"] else ToolResult.fail(raw.get("error", "")))
+                # 修复逻辑审计 #9：失败分支保留 result 与全部 extra（与
+                # ToolRegistry.call 同口径）—— 降级标记/partial 明细不许被吞
+                extra = {k: v for k, v in raw.items()
+                         if k not in ("success", "result", "error")}
+                err = raw.get("error")
+                if not raw["success"] and not err:
+                    err = "未知错误"
+                return ToolResult(success=bool(raw["success"]),
+                                  result=raw.get("result"),
+                                  error=err, extra=extra)
             return ToolResult.ok(raw)
         except Exception as e:
             return ToolResult.fail(f"Skill 执行异常: {type(e).__name__}: {e}")
 
     def list_skills(self) -> list[ToolSchema]:
         return list(self._schemas.values())
+
+    def functions(self) -> dict[str, ToolFunc]:
+        """已注册技能 {名: 函数} 的只读快照（组5 签名核对用）。"""
+        return dict(self._skills)
 
     # ----------------------------------------------------------
     # 预置默认 Skill
@@ -139,6 +158,8 @@ class SkillLibrary(ISkillLibrary):
         base = Path(path).expanduser().resolve()
         if not base.is_dir():
             return {"success": False, "error": f"目录不存在: {base}"}
+
+        workers = _as_int(workers, 1)      # 字符串数值容错（V-03）
 
         # Week3 加固：禁止整理系统目录（防止把系统文件搬走）
         from .default_tools import _is_protected_path
@@ -199,6 +220,20 @@ class SkillLibrary(ISkillLibrary):
                 errors.append(err)
 
         total = sum(len(v) for v in moved.values())
+        # 失败必须可见：只要存在搬运错误就判失败（不再"有错误也报 success=True"
+        # 让审计/统计把失败算成成功）；错误明细仍随 result 一并返回。
+        if errors:
+            return {
+                "success": False,
+                "error": f"{len(errors)}/{len(plan)} 个文件搬运失败: "
+                         + "; ".join(errors[:3]),
+                "result": {
+                    "path": str(base), "total_moved": total, "categories": moved,
+                    "skipped": skipped, "workers": workers,
+                    "errors": errors[:10], "error_count": len(errors),
+                    "partial": bool(total),
+                },
+            }
         return {
             "success": True,
             "result": {
@@ -207,7 +242,6 @@ class SkillLibrary(ISkillLibrary):
                 "categories": moved,
                 "skipped": skipped,
                 "workers": workers,
-                **({"errors": errors[:10], "error_count": len(errors)} if errors else {}),
             },
         }
 
@@ -255,23 +289,39 @@ class SkillLibrary(ISkillLibrary):
         }
 
     def _find_files(self, directory: str = "~", pattern: str = "*") -> dict:
-        """按条件搜索文件。"""
+        """按条件搜索文件（pattern 限定为目录内的相对 glob）。"""
         base = Path(directory).expanduser().resolve()
         if not base.is_dir():
             return {"success": False, "error": f"目录不存在: {base}"}
 
+        pat = str(pattern or "*").strip() or "*"
+        # 越界防线：rglob 对绝对模式/含 .. 的模式会走出 directory。
+        # 修复逻辑审计（轻微）：os.path.isabs 在 Windows 上判 POSIX 风格
+        # "/etc/x" 为 False（与 os.path.join 口径不一致），补前导 / \ 判定 ——
+        # 与组1 _is_abs_any 同思路（此处不 import 组1，保持 src 层自足）。
+        if os.path.isabs(pat) or pat.startswith(("/", "\\")) \
+                or ".." in Path(pat).parts \
+                or re.match(r"^[a-zA-Z]:", pat):
+            return {"success": False,
+                    "error": f"参数错误: pattern 必须是目录内的相对模式，收到 {pattern!r}"}
+
         matches = []
+        truncated = False
         try:
-            for p in base.rglob(pattern):
-                if p.is_file():
-                    matches.append({
-                        "path": str(p),
-                        "name": p.name,
-                        "size": p.stat().st_size,
-                        "suffix": p.suffix,
-                    })
+            for p in base.rglob(pat):
+                try:
+                    if p.is_file():
+                        matches.append({
+                            "path": str(p),
+                            "name": p.name,
+                            "size": p.stat().st_size,
+                            "suffix": p.suffix,
+                        })
+                except OSError:
+                    continue      # 元数据不可读（坏符号链接等）→ 跳过该条
                 # 限额保护：目录巨大时最多收集 100 个结果
                 if len(matches) >= 100:
+                    truncated = True
                     break
         except PermissionError:
             return {"success": False, "error": f"权限不足: {base}"}
@@ -280,8 +330,9 @@ class SkillLibrary(ISkillLibrary):
             "success": True,
             "result": {
                 "directory": str(base),
-                "pattern": pattern,
+                "pattern": pat,
                 "count": len(matches),
+                "truncated": truncated,     # 命中上限被截断时如实标注
                 "files": matches[:50],
             },
         }
@@ -298,6 +349,7 @@ class SkillLibrary(ISkillLibrary):
         if prot:
             return {"success": False, "error": f"拒绝清理受保护路径: {base} ({prot})"}
 
+        max_age_days = _as_int(max_age_days, 7)   # 字符串数值容错（V-03）
         # 只清理 mtime 早于截止时间的文件（默认保留 7 天）
         cutoff = time.time() - max_age_days * 86400
         removed = []
@@ -314,7 +366,7 @@ class SkillLibrary(ISkillLibrary):
                 errors.append(f"{f.name}: {e}")
 
         return {
-            "success": True,
+            "success": not errors,
             "result": {
                 "path": str(base),
                 "removed_count": len(removed),
@@ -322,6 +374,8 @@ class SkillLibrary(ISkillLibrary):
                 "removed_files": removed[:20],
                 "errors": errors[:10],
             },
+            **({"error": f"{len(errors)} 个临时文件删除失败（明细见 result.errors）"}
+               if errors else {}),
         }
 
     def _backup_directory(self, src: str, dest: str | None = None) -> dict:
@@ -333,6 +387,14 @@ class SkillLibrary(ISkillLibrary):
         if dest is None:
             ts = time.strftime("%Y%m%d_%H%M%S")
             dest = f"{src_p}_{ts}_backup"
+        else:
+            # 修复逻辑审计（轻微）：相对 dest 此前被 shutil.make_archive 按
+            # **进程 CWD** 解析（曾把备份 zip 写进项目根）——锚定到源目录旁，
+            # 与"产物落在目标附近"的用户预期一致
+            dp = Path(str(dest)).expanduser()
+            if not dp.is_absolute() and not re.match(r"^[a-zA-Z]:", str(dp)):
+                dp = src_p.parent / dp
+            dest = str(dp)
         try:
             shutil.make_archive(dest, "zip", str(src_p))
             return {"success": True, "result": f"已备份到 {dest}.zip"}
@@ -345,6 +407,8 @@ class SkillLibrary(ISkillLibrary):
         if not target.exists():
             return {"success": False, "error": f"目录不存在: {path}"}
 
+        min_size_mb = _as_int(min_size_mb, 100)   # 字符串数值容错（V-03）
+        top_n = _as_int(top_n, 20)
         min_bytes = min_size_mb * 1024 * 1024
         large_files = []
 

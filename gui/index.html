@@ -78,12 +78,46 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
 .badge-use{background:var(--blue-bg);color:var(--blue)}
 .badge-pub{background:#f1f5f9;color:var(--sub)}
 .hit b{font-size:13px}.hit .m{font-size:12px;color:var(--sub);margin:4px 0}
+/* ---------- 表单字段（工具台/LLM/设置共用） ---------- */
+/* 早期这 7 个类没有定义：.field 无布局、.tip/.req 无样式、提权行 .hl 无高亮、
+   .bar-row/.bar-track/.bar-fill 缺失导致统计条形图**完全不可见** */
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12.5px;font-weight:600;margin-bottom:5px}
+.field input,.field select,.field textarea{width:100%}
+.field .tip{font-weight:400;color:var(--sub);margin-left:6px}
+.field .req{color:var(--red);font-weight:700}
+/* ---------- 步骤表：提权行高亮 ---------- */
+tbody tr.hl{background:var(--amber-bg)}
+/* ---------- 统计条形图 ---------- */
+.bar-row{display:grid;grid-template-columns:150px 1fr 170px;gap:10px;
+  align-items:center;padding:5px 0;font-size:12.5px}
+.bar-track{background:#eef2f7;border-radius:99px;height:12px;overflow:hidden}
+.bar-fill{background:var(--blue);height:100%;border-radius:99px}
+/* ---------- 能力清单列表（工具台左栏） ---------- */
+.list{border:1px solid var(--line);border-radius:10px;background:#fff;
+  max-height:640px;overflow:auto}
+.list .item{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  border-bottom:1px solid var(--line);cursor:pointer}
+.list .item:last-child{border-bottom:0}
+.list .item:hover{background:#f6f9ff}
+.list .item.on{background:var(--blue-bg);box-shadow:inset 3px 0 0 var(--blue)}
+.toolbar{display:flex;gap:8px;align-items:center;margin-top:8px;
+  font-size:12.5px;color:var(--sub)}
+/* ---------- 对话助手：常用提问 chips + 答案来源标签 ---------- */
+.quick{display:flex;flex-wrap:wrap;gap:8px}
+.quick .ghost{font-size:12px;padding:5px 12px}
+.src-chip{display:inline-block;font-size:10.5px;color:var(--sub);background:#eef2f7;
+  border-radius:99px;padding:1px 8px;margin-bottom:4px}
 /* ---------- 对话助手 ---------- */
 .chat-log{height:430px;overflow:auto;background:#fbfdff;border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px}
 .bubble{max-width:78%;padding:9px 13px;border-radius:12px;font-size:13px;white-space:pre-wrap;word-break:break-all;line-height:1.55}
 .bubble.user{align-self:flex-end;background:var(--blue);color:#fff;border-bottom-right-radius:4px}
 .bubble.assistant{align-self:flex-start;background:#fff;border:1px solid var(--line);border-bottom-left-radius:4px}
 .bubble.assistant.err{background:var(--red-bg);border-color:var(--red);color:var(--red)}
+/* 工具真实产出（简单问题的答案）：左侧蓝条 + 浅底，与普通回答区分 */
+.bubble.assistant.tool-out{background:#f8fbff;border-left:3px solid var(--blue);
+  border-radius:6px 12px 12px 6px}
+.bubble.assistant.tool-out .md-code{margin:6px 0}
 .bubble.op-card{border-color:var(--amber);background:var(--amber-bg);max-width:92%}
 .chat-input-row{display:flex;gap:10px;margin-top:12px;align-items:flex-end}
 .bubble pre.md-code{background:#0f172a;color:#e2e8f0;padding:10px 12px;border-radius:8px;overflow:auto;font-size:12px;margin:6px 0;font-family:Consolas,monospace}
@@ -102,6 +136,7 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
 <header>
   <h1>Agent_OS_v1.0 · 系统控制台</h1>
   <span class="warn">⚠ 编排会执行真实 OS 操作 —— 演示请用沙箱目录</span>
+  <span id="boot-info" style="font-size:11.5px;color:var(--sub);margin-left:10px"></span>
   <nav>
     <button data-p="orch" class="on">编排控制台</button>
     <button data-p="chat">对话助手</button>
@@ -119,7 +154,7 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
   <div class="card">
     <h2>五组集成编排<span style="font-weight:400;font-size:12px;color:var(--sub)">　用户 → 组1 → 组5安全 → 组2 → 组3 → 组4 ←→ 组5审计/RAG</span></h2>
     <div style="display:flex;gap:10px;margin:12px 0 4px">
-      <input id="orch-text" style="flex:1" value="帮我把「demo_task」文件夹里的文件整理一下，顺便看看有没有重复文件，最后备个份"
+      <input id="orch-text" style="flex:1" value="搜索湖南大学"
         placeholder="输入自然语言指令，如：查询长沙天气 / 打开文件管理器 / rm -rf /（会被拦截）">
       <button class="go" id="orch-run" onclick="orchestrate()">▶ 运行编排</button>
     </div>
@@ -181,15 +216,32 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
       <button class="ghost" style="margin-left:12px" onclick="loadRuns()">刷新</button></h2>
     <table style="margin-top:10px"><thead><tr><th>时间</th><th>来源</th><th>指令</th><th>状态</th><th>结果</th></tr></thead>
     <tbody id="runs-rows"><tr><td colspan="5" class="empty">暂无运行</td></tr></tbody></table>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span style="font-size:12.5px;color:var(--sub)">归档回放（磁盘事件账本，重启后仍可查）：</span>
+      <select id="replay-tag" style="max-width:300px"><option value="">(未加载)</option></select>
+      <button class="ghost" onclick="loadReplayTags()">刷新</button>
+      <button class="ghost" onclick="replayRun()">回放</button>
+    </div>
+    <div class="result plain" id="replay-out" style="display:none;margin-top:8px;max-height:260px;overflow:auto"></div>
   </div>
 </section>
 
 <!-- ============ 对话助手 ============ -->
 <section class="page" id="page-chat">
   <div class="card">
-    <h2>对话助手<span style="font-weight:400;font-size:12px;color:var(--sub)">　直连 LLM 厂商（流式输出）；说出系统操作会弹出执行卡片，确认后才真实执行</span></h2>
+    <h2>对话助手<span style="font-weight:400;font-size:12px;color:var(--sub)">　只回答本系统<b>真实具备</b>的能力与<b>真实查到</b>的数据（能力清单由组4 schema 现场生成，LLM 不得越界）；说出系统操作会弹出执行卡片，确认后才真实执行</span></h2>
+    <div class="card" style="padding:10px 14px;margin:0 0 10px;background:#fbfdff">
+      <div style="font-size:12.5px;color:var(--sub);margin-bottom:8px">常用提问（点击即发；答案来自真实能力清单 / 真实数据，不经 LLM 自由发挥）：</div>
+      <div class="quick" id="chat-quick">
+        <button class="ghost" onclick="askQuick('你能做什么')">你能做什么</button>
+        <button class="ghost" onclick="askQuick('当前系统状态和最近的编排运行结果')">当前运行状态</button>
+        <button class="ghost" onclick="askQuick('调用统计的总调用量、成功率和失败最多的接口')">调用统计</button>
+        <button class="ghost" onclick="askQuick('知识库里都有哪些轨迹')">知识库轨迹</button>
+        <button class="ghost" onclick="askQuick('当前系统设置和受保护路径有哪些')">当前设置</button>
+      </div>
+    </div>
     <div id="chat-log" class="chat-log">
-      <div class="bubble assistant">你好，我是控制台对话助手。直接提问即可；说出系统操作（如"打开文件管理器"）会弹出执行卡片，点击「执行」才会真实运行并走完整安全管线。</div>
+      <div class="bubble assistant">你好，我是控制台内置对话助手。我能做的只有两类：<b>①查本系统的真实数据</b>（调用统计 / 运行与审计结果 / RAG 轨迹 / 控件后端 / 系统设置）；<b>②按真实能力清单解释本系统能做什么、怎么做</b>。真实操作（文件、命令、邮件、网页、桌面）请直接说指令 —— 我会弹执行卡片，确认后经安全闸门真实执行。</div>
     </div>
     <div class="chat-input-row">
       <textarea id="chat-input" rows="2" style="flex:1" placeholder="输入消息，Enter 发送 / Shift+Enter 换行"></textarea>
@@ -335,7 +387,12 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-size:11.5px}
 
 <script>
 const $=s=>document.querySelector(s);
-const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+/* HTML 转义：除 & < > 外**必须**转义引号 —— mdRender 会把 URL 拼进
+   href="…"，只转 & < > 时 `https://a" onmouseover="…` 可逃逸属性上下文执行脚本 */
+const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+  .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+/* 只允许 http/https 进入 href（javascript:/data: 等一律丢弃） */
+const safeUrl=u=>/^https?:\/\//i.test(String(u||"").trim())?String(u).trim():"";
 const pretty=o=>JSON.stringify(o,null,2);
 
 /* 导航 */
@@ -346,7 +403,7 @@ document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
   if(b.dataset.p==="stats")refreshStats();
   if(b.dataset.p==="rag")ragQuery();
   if(b.dataset.p==="chat")loadChatHistory();
-  if(b.dataset.p==="orch")loadRuns();
+  if(b.dataset.p==="orch"){loadRuns();loadReplayTags();}
   if(b.dataset.p==="llm"){loadLLM();loadSMTP()}
   if(b.dataset.p==="settings")loadSettings();
 });
@@ -358,7 +415,6 @@ async function post(url,body){const r=await fetch(url,{method:"POST",
   headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});return r.json()}
 
 let CURSOR=0,RUN_ID=null,POLL=null,LAST_ENGINE="rules";
-function _flowTo(n){/* 点亮前 n 个盒子 */}
 /* 发起编排：先 /api/plan 规划；需确认则弹面板，否则直接开始轮询事件流 */
 async function orchestrate(){
   const btn=$("#orch-run");btn.disabled=true;btn.textContent="组1 意图理解中（LLM，复杂任务最长约 2 分钟）…";
@@ -386,8 +442,18 @@ async function orchestrate(){
       (staged.degraded?'<div class="bad" style="margin-bottom:6px">⚠ LLM 不可用，本计划由规则引擎粗略解析 —— 复杂任务建议稍后重试</div>':"")+
       `<div>本计划包含<b>高影响动作</b>，需要你批准：</div>`+
       staged.admin_steps.map(s=>`<div>🔑 步骤${s.step} <code>${esc(s.action)}</code> 需要提权 ADMIN</div>`).join("")+
-      staged.real_send_steps.map(s=>`<div>📧 步骤${s.step} <code>send_email</code> 将<b>真实发送</b>：to=${esc(s.params.to||"")} 主题=${esc(s.params.subject||"")}${s.params.attachment?` 附件=${esc(s.params.attachment)}`:""}</div>`).join("");
+      staged.real_send_steps.map(s=>`<div>📧 步骤${s.step} <code>send_email</code> 将<b>真实发送</b>：to=${esc(s.params.to||"")} 主题=${esc(s.params.subject||"")}${s.params.attachment?` 附件=${esc(s.params.attachment)}`:""}</div>`).join("")+
+      /* 修复逻辑审计 #23：决策表/规划器的通道改写要让用户看得见 ——
+         确认的是"改写后的方案"，不展示 route_reason 等于暗改执行通道 */
+      (staged.plan?.steps||[]).filter(s=>s.route_reason).map(s=>
+        `<div>🔀 步骤${s.step_id} <code>${esc(s.action)}</code>：${esc(s.route_reason)}</div>`).join("");
     return;
+  }
+  /* 修复逻辑审计（轻微·/api/plan 报错形态）：服务端 200 + {error} 时旧代码
+     直接 startPolling(undefined)，真错被"运行不存在"掩盖 */
+  if(!staged.pending && !staged.run_id){
+    $("#orch-steps").innerHTML=`<tr><td class="empty bad">${esc(staged.error||"规划失败：服务端未返回 run_id")}</td></tr>`;
+    v.className="verdict fail";v.textContent="失败";return;
   }
   startPolling(staged.run_id);
 }
@@ -401,7 +467,10 @@ function showStaged(staged){
 }
 /* 确认面板按钮：full=全部执行（含提权） safe=只跑免提权步骤 cancel=取消 */
 async function confirmExecute(mode){
-  if(mode==="cancel"){$("#orch-confirm").style.display="none";$("#orch-steps").innerHTML='<tr><td colspan="5" class="empty">已取消</td></tr>';return}
+  if(mode==="cancel"){
+    /* 修复逻辑审计 #15：取消要请服务端消费令牌（旧版只藏面板，令牌 30 分钟内仍可被复用执行） */
+    if(PIPE_TOKEN){post("/api/cancel",{token:PIPE_TOKEN}).catch(()=>{});PIPE_TOKEN=null}
+    $("#orch-confirm").style.display="none";$("#orch-steps").innerHTML='<tr><td colspan="5" class="empty">已取消</td></tr>';return}
   $("#orch-confirm").style.display="none";
   const r=await post("/api/execute",{token:PIPE_TOKEN,mode});
   if(r.run_id)startPolling(r.run_id);
@@ -421,6 +490,13 @@ async function pollRun(){
   let d;
   try{d=await fetch(`/api/run?id=${RUN_ID}&cursor=${CURSOR}`).then(r=>r.json())}
   catch(e){return}   // 瞬时网络抖动：下一轮再取
+  // 运行不存在/服务端异常：回的是 {error:...}，早期直接 d.events.forEach
+  // 会抛 TypeError，setInterval 每 800ms 抛一次且页面毫无提示 → 停止并如实显示
+  if(d.error||!Array.isArray(d.events)){
+    clearInterval(POLL);POLL=null;RUN_ID=null;
+    $("#orch-steps").innerHTML=`<tr><td colspan="5" class="empty bad">${esc(d.error||"运行状态不可用")}</td></tr>`;
+    return;
+  }
   CURSOR=d.cursor;
   d.events.forEach(e=>{
     FLOW.forEach(id=>document.getElementById(id).classList.add("lit"));
@@ -429,8 +505,8 @@ async function pollRun(){
     if(e.stage==="plan")litFlow(3);
     if(e.stage==="step"){
       litFlow(4);
-      const r=e.step.tool_result,escSteps=new Set((BUNDLE?.session?.escalations||[]).map(x=>x.step));
-      const row=`<tr><td>${e.step.step}</td><td><b>${esc(e.step.name)}</b><br><span style="color:var(--sub);font-size:11px">${e.step.kind}</span></td>
+      const r=e.step.tool_result||{};
+      const row=`<tr><td>${e.step.step}</td><td><b>${esc(e.step.name)}</b><br><span style="color:var(--sub);font-size:11px">${esc(e.step.kind)}</span></td>
         <td>${esc(e.step.level_used)}</td><td>${e.step.duration_ms} ms</td>
         <td><span class="chip ${r.success?"ok":"bad"}">${r.success?"成功":"失败"}</span>
         ${r.success?"":`<br><span class="bad" style="font-size:11px">${esc(r.error||"")}</span>`}</td></tr>`;
@@ -446,6 +522,7 @@ async function pollRun(){
     BUNDLE=d.bundle||{ok:false,error:d.error||d.rejected};
     if(BUNDLE&&BUNDLE.session){renderBundle()}
     else if(d.status==="failed"){$("#orch-steps").innerHTML=`<tr><td class="empty bad">${esc(d.error||"执行失败")}</td></tr>`}
+    else if(d.status==="rejected"){$("#orch-steps").innerHTML=`<tr><td class="empty bad">⛔ ${esc(BUNDLE.rejected||d.rejected||"被安全复检拦截")}</td></tr>`}
   }
 }
 function litFlow(n){
@@ -465,28 +542,33 @@ function renderBundle(){
      <div class="kpi"><div class="v ${(st.summary?.fail??s.fail)?"bad":""}">${st.summary?.fail??s.fail??0}</div><div class="l">失败</div></div>
      <div class="kpi"><div class="v">${st.summary?.rate??0}%</div><div class="l">成功率</div></div>
      <div class="kpi"><div class="v ok">${BUNDLE.session?BUNDLE.session.summary.success+"/"+BUNDLE.session.summary.total:"-"}</div><div class="l">组3 步骤成功</div></div>`;
+  const steps=BUNDLE.session?.steps||[];
   const escSteps=new Set((BUNDLE.session?.escalations||[]).map(x=>x.step));
-  $("#orch-steps").innerHTML=BUNDLE.session.steps.map(st=>{
-    const r=st.tool_result;
+  $("#orch-steps").innerHTML=steps.map(st=>{
+    const r=st.tool_result||{};
     return `<tr class="${escSteps.has(st.step)?"hl":""}"><td>${st.step}</td>
-      <td><b>${esc(st.name)}</b><br><span style="color:var(--sub);font-size:11px">${st.kind}</span></td>
+      <td><b>${esc(st.name)}</b><br><span style="color:var(--sub);font-size:11px">${esc(st.kind||"")}</span></td>
       <td>${esc(st.level_used)}${escSteps.has(st.step)?' <span class="chip esc">提权</span>':""}</td>
       <td>${st.duration_ms} ms</td>
       <td><span class="chip ${r.success?"ok":"bad"}">${r.success?"成功":"失败"}</span>
-      ${r.success?`<br><span style="color:var(--sub);font-size:11px">${esc(String(r.result).slice(0,60))}</span>`
-                 :`<br><span class="bad" style="font-size:11px">${esc(r.error||"")}</span>`}</td></tr>`}).join("");
+      ${r.success?`<br><span style="color:var(--sub);font-size:11px">${esc(typeof r.result==="string"?r.result:JSON.stringify(r.result??null)).slice(0,60)}</span>`
+                 :`<br><span class="bad" style="font-size:11px">${esc(r.error||"失败（无错误信息）")}</span>`}</td></tr>`}).join("")
+    ||'<tr><td colspan="5" class="empty">无步骤</td></tr>';
   let ev=`<div>🧠 意图引擎：<b>${esc(LAST_ENGINE||"rules")}</b>（仅组1 意图理解调用 LLM，其余组全部本地执行）</div>`;
-  (BUNDLE.session.escalations||[]).forEach(e=>ev+=`<div>🔑 <span class="chip esc">提权流</span> 步骤${e.step} ${esc(e.tool)}：${esc(e.from)} 被拒 → 已确认 → ADMIN 重试</div>`);
+  /* 修复逻辑审计 #23：plan.routes / route_reason 此前零消费 —— 通道改写只
+     存在于 JSON 里，事件流必须回放"哪个步骤被改写、为什么" */
+  ((BUNDLE.plan&&BUNDLE.plan.steps)||[]).filter(s=>s.route_reason).forEach(s=>ev+=
+    `<div>🔀 通道改写 步骤${s.step_id} <b>${esc(s.action)}</b>：${esc(s.route_reason)}</div>`);
+  // 提权事件按"真的重试过"与"被拒绝"分开显示，并标出确认来源；早期把
+  // "用户拒绝提权"也渲染成"已确认 → ADMIN 重试"（界面替用户代签）
+  (BUNDLE.session.escalations||[]).forEach(e=>{
+    const how=e.confirm_mode==="human"?"用户确认":"无人值守自动同意";
+    ev+=`<div>🔑 <span class="chip esc">提权流</span> 步骤${e.step} ${esc(e.tool)}：${esc(e.from)} 被拒 → ${esc(how)} → ADMIN 重试</div>`});
+  (BUNDLE.session.escalations_denied||[]).forEach(e=>ev+=
+    `<div>🚫 <span class="chip bad">提权被拒</span> 步骤${e.step} ${esc(e.tool)}：未提权，该步骤按原权限失败</div>`);
   (BUNDLE.session.self_healed||[]).forEach(h=>ev+=`<div>🩹 自愈 ${esc(h.wrong)} → <b>${esc(h.fixed)}</b></div>`);
   $("#orch-events").innerHTML=ev||'';
   showPipeJson("audit");
-}
-function showPipeJson(which){
-  document.querySelectorAll("#orch-tabs button").forEach(b=>b.classList.toggle("on",b.dataset.a===which));
-  const box=$("#orch-json");if(!BUNDLE){box.textContent="—";return}
-  const map={intent:BUNDLE.intent,check:BUNDLE.check,plan:BUNDLE.plan,
-             session:BUNDLE.session,audit:BUNDLE.audit,stats:BUNDLE.stats_detail||{}};
-  box.textContent=pretty(map[which]||{});
 }
 function showPipeJson(which){
   document.querySelectorAll("#orch-tabs button").forEach(b=>b.classList.toggle("on",b.dataset.a===which));
@@ -516,15 +598,49 @@ async function loadRuns(){
 }
 async function loadRun(rid){
   const d=await fetch(`/api/run?id=${rid}&cursor=0`).then(r=>r.json());
-  if(!d.bundle)return;
+  if(!d.bundle){
+    $("#orch-steps").innerHTML=`<tr><td colspan="5" class="empty bad">${esc(d.error||"该运行没有可回看的结果包")}</td></tr>`;
+    return;
+  }
   BUNDLE=d.bundle;renderBundle();showPipeJson("plan");
 }
-let CHAT=[];
+/* ---------- 归档回放（事件账本；优化方案 1.1/2.4） ---------- */
+async function loadReplayTags(){
+  try{
+    const d=await fetch("/api/replays").then(r=>r.json());
+    const list=d.replays||[];
+    $("#replay-tag").innerHTML=list.length
+      ?list.map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join("")
+      :'<option value="">(暂无归档)</option>';
+  }catch(e){/* 回放是旁路能力，失败不阻断页面 */}
+}
+async function replayRun(){
+  const t=$("#replay-tag").value; if(!t)return;
+  const d=await fetch(`/api/replays?tag=${encodeURIComponent(t)}`).then(r=>r.json());
+  const evs=d.events||[];
+  const out=$("#replay-out"); out.style.display="";
+  out.innerHTML=evs.length?evs.map(e=>{
+    const info=Object.entries(e)
+      .filter(([k])=>!["seq","run_id","time","elapsed_ms","stage"].includes(k))
+      .map(([k,v])=>`${esc(k)}=${esc(typeof v==="object"?JSON.stringify(v):String(v))}`)
+      .join("  ");
+    return `<div>#${e.seq} <code>${esc(e.time||"")}</code> <b>${esc(e.stage)}</b>`
+      +` <span style="color:var(--sub);font-size:12px">${info}</span></div>`;
+  }).join(""):"<div class='empty'>该归档没有事件账本（早于事件流版本产生）</div>";
+}
+/* 聊天记录：DOM 与 CHAT 是本页的真相，服务端文件只用于"刷新后恢复"。
+   只有用户点「清空对话」才会清空 —— 切页签不再重建 DOM（那会抹掉操作卡片、
+   步骤列表这类未落盘的记录）。 */
+let CHAT=[],CHAT_SYNCED=false;
 function addBubble(role,text){
   const b=document.createElement("div");b.className="bubble "+role;b.textContent=text;
   const log=$("#chat-log");log.appendChild(b);log.scrollTop=log.scrollHeight;return b;
 }
-function clearChat(){CHAT=[];$("#chat-log").innerHTML='<div class="bubble assistant">对话已清空。有什么可以直接问我。</div>';saveChatHistory()}
+function clearChat(){
+  CHAT=[];CHAT_SYNCED=true;          // 标记已同步：后续切页签不再从服务端回填
+  $("#chat-log").innerHTML='<div class="bubble assistant">对话已清空（服务端记录也一并删除）。有什么可以直接问我。</div>';
+  saveChatHistory();
+}
 /* 对话内系统操作：执行卡片 → 用户点击 → 完整编排管线（安全+确认流） */
 function addOperationCard(ev){
   const card=document.createElement("div");card.className="bubble assistant op-card";
@@ -558,6 +674,22 @@ async function execOperation(btn){
   }
   runStaged(line,staged,"auto",text);
 }
+/* 把已成功步骤的**真实产出**拼成 markdown（供气泡渲染）。
+   简单问题（天气/磁盘/搜索…）的答案本身就是工具输出，不该只回一句"任务完成"。
+   过滤掉收尾演示命令的 echo 噪音与空结果；对象结果转 JSON 代码块。 */
+function stepOutputMd(sess){
+  const parts=[];
+  for(const st of ((sess&&sess.steps)||[])){
+    const tr=st.tool_result||{};
+    if(!tr.success)continue;
+    if(st.name==="run_command"&&(st.params_sent||{}).cmd==="echo [plan done]")continue;
+    let v=tr.result;
+    if(v===undefined||v===null||v==="")continue;
+    if(typeof v!=="string")v="```\n"+JSON.stringify(v,null,2)+"\n```";
+    parts.push("**"+st.name+"**\n\n"+v);
+  }
+  return parts.join("\n\n---\n\n");
+}
 async function runStaged(line,staged,mode,origText){
   let run_id=staged.run_id;
   if(staged.pending){
@@ -588,32 +720,34 @@ async function runStaged(line,staged,mode,origText){
       const a=d.bundle&&d.bundle.audit;
       const sum=sess?sess.summary:{};
       const ok=sum.success!=null?`${sum.success}/${sum.total} 步成功`:"";
-      // 计划里的 llm_answer 产出 = 用户要的"回答"：提取为独立气泡
-      // （markdown 渲染），并连同原始问题写入聊天历史（追问有上下文）
-      let answered=false;
+      // ① 计划里有 llm_answer → 那就是用户要的"回答"
+      let answered=false,answerText="";
       if(sess){
         for(const st of sess.steps.filter(x=>x.name==="llm_answer"
             &&(x.tool_result||{}).success)){
           const res=st.tool_result.result||{};
-          if(res.answer){
-            addBubble("assistant",res.answer).innerHTML=mdRender(res.answer);
-            answered=true;
-          }
-        }
-        if(answered&&origText){
-          CHAT.push({role:"user",content:origText},
-                    {role:"assistant",content:sess.steps
-                      .filter(x=>x.name==="llm_answer").pop().tool_result.result.answer});
-          saveChatHistory();
+          if(res.answer){answerText=res.answer;answered=true}
         }
       }
-      // 完成提示用独立气泡，醒目且不被步骤列表淹没
-      if(a&&a.verdict==="PASS")
-        addBubble("assistant",`✅ 任务完成：${ok}，审计 PASS`);
-      else if(a)
-        addBubble("assistant",`❌ 任务结束：${ok||"无步骤"}，审计 ${a.verdict}`);
-      else
-        addBubble("assistant","❌ 任务失败："+esc(d.error||"未知错误"));
+      // ② 没有 llm_answer 时，把**工具的真实产出**渲染出来（markdown），
+      //    而不是只回一句"任务完成"——天气/磁盘/搜索这类结果本身就是答案
+      const outMd=answered?"":stepOutputMd(sess);
+      if(answered){addBubble("assistant",answerText).innerHTML=mdRender(answerText)}
+      else if(outMd){
+        const bb=addBubble("assistant",outMd);
+        bb.classList.add("tool-out");
+        bb.innerHTML=mdRender(outMd);
+      }
+      // ③ 完成提示（注意走 textContent，不要再 esc 一次造成双重转义）
+      const done=(a&&a.verdict==="PASS")?`✅ 任务完成：${ok}，审计 PASS`
+        :a?`❌ 任务结束：${ok||"无步骤"}，审计 ${a.verdict}`
+        :"❌ 任务失败："+String(d.error||"未知错误");
+      addBubble("assistant",done);
+      // ④ 落进聊天历史：刷新/切页签后仍在，**只有点「清空对话」才清空**
+      const keep=[answerText,outMd,done].filter(Boolean).join("\n\n");
+      if(origText)CHAT.push({role:"user",content:origText});
+      if(keep)CHAT.push({role:"assistant",content:keep.slice(0,4000)});
+      saveChatHistory();
       line.appendChild(document.createElement("div"));   // 占位收尾
       $("#chat-log").scrollTop=$("#chat-log").scrollHeight;return;
     }
@@ -629,8 +763,10 @@ function mdRender(src){
     .replace(/`([^`]+)`/g,"<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g,"$1<i>$2</i>")
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>')
-    .replace(/(^|[\s（(])((?:https?:\/\/)[^\s<）)]+)/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,(m,t,u)=>{const s=safeUrl(u);
+      return s?`<a href="${esc(s)}" target="_blank" rel="noopener">${t}</a>`:t})
+    .replace(/(^|[\s（(])((?:https?:\/\/)[^\s<）)]+)/g,(m,p1,u)=>{const s=safeUrl(u);
+      return s?`${p1}<a href="${esc(s)}" target="_blank" rel="noopener">${s}</a>`:m});
   let html="",inCode=false,code=[],list=null;
   const closeList=()=>{if(list){html+=list==="ul"?"</ul>":"</ol>";list=null}};
   for(const raw of String(src).split("\n")){
@@ -672,8 +808,23 @@ async function sendChat(){
         const seg=buf.slice(0,idx).trim();buf=buf.slice(idx+2);
         if(!seg.startsWith("data:"))continue;
         const ev=JSON.parse(seg.slice(5));
-        if(ev.route==="operation"){b.remove();addOperationCard(ev);return}
+        // 答案来源标签：capability=本地能力清单(零 LLM) / facts=真实数据 / llm=LLM
+        if(ev.meta){
+          const chip=document.createElement("div");
+          chip.className="src-chip";
+          chip.textContent="来源："+(ev.meta.label||ev.meta.source||"");
+          if(b.parentNode)b.parentNode.insertBefore(chip,b);
+          continue;
+        }
+        if(ev.route==="operation"){
+          // 执行卡片也要落进历史，否则刷新后只剩一句没有回应的提问
+          CHAT.push({role:"assistant",
+                     content:`（检测到系统操作：${(ev.actions||[]).join(" → ")}，已生成执行卡片；确认后才会真实执行）`});
+          saveChatHistory();
+          b.remove();addOperationCard(ev);return}
         if(ev.route==="complex"){
+          CHAT.push({role:"assistant",content:"（多步复杂任务，已引导到「编排控制台」执行）"});
+          saveChatHistory();
           b.classList.add("op-card");b.innerHTML=
             '<div>🧭 这是多步复杂任务——请到「编排控制台」执行</div>'+
             '<div style="font-size:11.5px;color:var(--sub);margin:4px 0">复杂任务的规划由 LLM 完成（约 1~2 分钟），对话助手只负责简单操作与问答。检测到的动作：'+
@@ -691,6 +842,12 @@ async function sendChat(){
   }catch(e){b.classList.add("err");b.textContent="✗ 请求失败: "+e}
   finally{$("#chat-send").disabled=false}
   input.focus();
+}
+/* 常用提问：填进输入框并直接发送（服务端会走确定性能力清单/真实数据通道） */
+function askQuick(text){
+  const input=$("#chat-input");
+  input.value=text;
+  sendChat();
 }
 $("#chat-input").addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat()}});
@@ -752,9 +909,13 @@ function renderForm(t){
     html+='<div class="desc">此能力无需参数，直接执行。</div>';
   for(const[k,p]of Object.entries(props)){
     const def=p.default!==undefined&&p.default!==null?`value="${esc(String(p.default))}"`:"";
+    const hint=p.type==="number"?"（数字）":p.type==="array"?"（多个用逗号分隔）":"";
+    // array 类型用 textarea 收多值（早期一律 input，send_email 多附件无法提交）
+    const ctrl=p.type==="array"
+      ? `<textarea id="f-${esc(k)}" data-k="${esc(k)}" data-t="array" rows="2"></textarea>`
+      : `<input id="f-${esc(k)}" data-k="${esc(k)}" data-t="${esc(p.type)}" ${def}>`;
     html+=`<div class="field"><label>${esc(k)}${req.includes(k)?'<span class="req"> *</span>':""}
-      <span class="tip">${esc(p.description||"")}${p.type==="number"?"（数字）":""}</span></label>
-      <input id="f-${esc(k)}" data-k="${esc(k)}" data-t="${p.type}" ${def}></div>`;
+      <span class="tip">${esc(p.description||"")}${hint}</span></label>${ctrl}</div>`;
   }
   html+=`<div class="field"><label>以什么身份调用（user_level）</label><div class="lvl" id="lvl">`;
   for(const l of["public","user","admin"])
@@ -773,7 +934,14 @@ async function callTool(){
     if((v.startsWith('"')&&v.endsWith('"'))||(v.startsWith("'")&&v.endsWith("'")))v=v.slice(1,-1).trim();
     if(v==="")return;if(el.dataset.t==="number"){const n=Number(v);if(!Number.isNaN(n))v=n}
     if(el.dataset.t==="boolean")v=!(v.toLowerCase()in{"false":1,"0":1,"no":1,"off":1});
-    params[el.dataset.k]=v});
+    // array 类型参数（send_email 的 to / attachment 等）：逗号或换行分隔 → 真数组；
+    // 否则工具只收到一个字符串，多收件人/多附件无法提交
+    if(el.dataset.t==="array"){
+      const arr=String(v).split(/[,，\n]/).map(x=>x.trim()).filter(Boolean);
+      params[el.dataset.k]=arr.length>1?arr:(arr[0]||v);
+    }else{
+      params[el.dataset.k]=v;
+    }});
   const box=$("#tool-res");box.style.display="block";box.className="result plain";box.textContent="执行中…";
   const data=await post(categoryOf(cur)==="skill"?"/api/skill":"/api/call",
                         {name:cur.name,params,level});
@@ -889,7 +1057,7 @@ async function loadControls(){
     const d=await fetch("/api/controls").then(r=>r.json());
     $("#ctl-meta").textContent=`后端: ${d.backend} | 元素 ${d.elements.length} 个`;
     box.innerHTML=d.elements.map(e=>
-      `<div style="padding:1px 0">${"　".repeat(Math.min(e.depth||0,10))}[${esc(e.role)}] <b>${esc((e.name||"").slice(0,36))}</b> <span style="color:var(--sub)">${esc((e.app||"").slice(0,20))} ${JSON.stringify(e.bbox)}</span></div>`).join("")
+      `<div style="padding:1px 0">${"　".repeat(Math.min(e.depth||0,10))}[${esc(e.role)}] <b>${esc((e.name||"").slice(0,36))}</b> <span style="color:var(--sub)">${esc((e.app||"-").slice(0,20))} ${esc(JSON.stringify(e.bbox||[]))}</span></div>`).join("")
       ||'<div class="empty">无元素</div>';
   }catch(e){box.textContent="读取失败: "+e}
 }
@@ -935,7 +1103,53 @@ async function resetSettings(){
   const r=await post("/api/settings/reset",{});
   if(r.ok){$("#set-status").textContent="✓ 已恢复默认";$("#set-status").style.color="var(--green)";loadSettings();loadLLM()}
 }
-$("#page-settings")&&0; /* 占位 */
+/* 服务信息：改了 .py 不重启就等于没改 —— 这里把"进程启动时间 / 源文件是否比进程新"
+   显示在页头，省得每次靠猜。（/api/about 由服务端提供） */
+async function loadAbout(){
+  const el=$("#boot-info");if(!el)return;
+  try{
+    const d=await fetch("/api/about").then(r=>r.json());
+    const stale=d.stale||[];
+    el.textContent=`服务 pid ${d.pid} · 启动 ${d.started_at}`
+      + (stale.length?`　⚠ 以下源文件比进程新，需重启：${stale.join("、")}`
+                     :"　✓ 进程与源码一致");
+    el.style.color=stale.length?"var(--red)":"var(--sub)";
+  }catch(e){el.textContent="（服务信息读取失败）"}
+}
+loadAbout();
+
+/* ---------- 对话历史持久化 ---------- */
+/* 这两个函数是 /api/chat_history 与 /api/chat_save 的前端包装。早期漏实现：
+   ① 页面初始化在 loadChatHistory() 处抛 ReferenceError → 之后同级的
+      loadLLM()/loadSMTP()/loadSettings() 与 #hash 直达全部不执行；
+   ② 每次对话成功（sendChat 末尾调 saveChatHistory()）都跳进 catch，把已渲染
+      好的回答气泡改成"✗ 请求失败: ReferenceError..."。 */
+async function loadChatHistory(){
+  /* 只在**首次**进入对话页时从服务端回填；此后 DOM 即真相 ——
+     切页签不会重建、更不会清空。想清空请用「清空对话」按钮。 */
+  if(CHAT_SYNCED)return;
+  try{
+    const d=await fetch("/api/chat_history").then(r=>r.json());
+    const msgs=d.messages||[];
+    CHAT_SYNCED=true;
+    if(!msgs.length)return;                      // 服务端无历史 → 保留当前欢迎语
+    if(CHAT.length||document.querySelectorAll("#chat-log .bubble").length>1){
+      return;                                    // 本地已有内容 → 绝不覆盖
+    }
+    CHAT=[];$("#chat-log").innerHTML="";
+    msgs.forEach(m=>{
+      const role=m.role==="user"?"user":"assistant";
+      CHAT.push({role:role,content:m.content||""});
+      const b=addBubble(role,m.content||"");
+      if(role!=="user")b.innerHTML=mdRender(m.content||"");
+    });
+    $("#chat-log").scrollTop=$("#chat-log").scrollHeight;
+  }catch(e){/* 历史加载失败不影响当前对话 */}
+}
+async function saveChatHistory(){
+  try{await post("/api/chat_save",{messages:CHAT.slice(-100)})}
+  catch(e){/* 落盘失败不打断对话主流程 */}
+}
 
 /* ---------- RAG ---------- */
 /* RAG 检索：有关键词=余弦相似检索，留空=最近轨迹 */
@@ -952,6 +1166,7 @@ async function ragQuery(){
 
 initTools();
 loadRuns();
+loadReplayTags();
 loadChatHistory();
 loadLLM();
 loadSMTP();

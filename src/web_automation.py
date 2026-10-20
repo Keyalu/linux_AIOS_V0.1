@@ -21,6 +21,7 @@ chromium-profile），不碰用户日常浏览器数据；端口仅绑 127.0.0.1
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -45,6 +46,21 @@ _PROFILE_DIR = Path.home() / ".local" / "share" / "agent_os" / "chromium-profile
 
 class CDPError(RuntimeError):
     """CDP 通道不可用（浏览器未装/启动超时/连接断开）。"""
+
+
+def _synchronized(fn):
+    """修复逻辑审计 #20：CDP 通道操作全量串行。
+
+    ThreadingHTTPServer 下编排线程与 /api/call 共用同一个 WebAutomation
+    单例：_msg_id+=1 非原子、发送与接收之间被并发插队就会丢掉非本 id 的
+    应答 → 串包/15s 超时。公开入口一律持实例 RLock（同线程可重入，
+    嵌套调用如 wait_page_ready_if_active→wait_page_ready 不自锁死）。"""
+    def inner(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    inner.__name__ = fn.__name__
+    inner.__doc__ = fn.__doc__
+    return inner
 
 
 class _CmdError(CDPError):
@@ -89,6 +105,13 @@ class _WebSocket:
         status = head.split(b"\r\n")[0]
         if b"101" not in status:
             raise CDPError(f"WebSocket 握手失败: {status[:60]!r}")
+        # 校验 Sec-WebSocket-Accept（RFC6455：base64(sha1(key + GUID))）——
+        # 只认状态码 101 会接受任何"碰巧回 101"的端点
+        expect = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+        ).digest())
+        if expect.lower() not in head.lower():
+            raise CDPError("WebSocket 握手校验失败（Sec-WebSocket-Accept 不符）")
 
     def send_text(self, payload: str) -> None:
         data = payload.encode()
@@ -123,7 +146,7 @@ class _WebSocket:
             if opcode == 0x8:                    # close
                 raise CDPError("浏览器关闭了 WebSocket 连接")
             if opcode == 0x9:                    # ping → pong
-                self._sock.sendall(bytes([0x8A, len(chunk)]) + chunk)
+                self._send_control(0xA, chunk)
                 continue
             if opcode in (0x1, 0x0):             # text / continuation
                 payload += chunk
@@ -139,6 +162,22 @@ class _WebSocket:
             self._buf += chunk
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
+
+    def _send_control(self, opcode: int, payload: bytes) -> None:
+        """发送控制帧（pong/close）。
+
+        控制帧 payload 规范上 ≤125 字节，但这里按真实长度正确编码扩展长度，
+        避免 len>=126 时把长度字节写成 0x80+len 产生非法帧（旧实现 bug）。
+        """
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([n])
+        elif n < 65536:
+            head += bytes([126]) + struct.pack(">H", n)
+        else:
+            head += bytes([127]) + struct.pack(">Q", n)
+        self._sock.sendall(head + payload)
 
     def close(self) -> None:
         try:
@@ -159,7 +198,10 @@ class WebAutomation:
                                                 _CDP_PORT_DEFAULT))
         self._ws: _WebSocket | None = None
         self._target_id: str | None = None
-        self._lock = threading.Lock()
+        self._msg_id = 0          # CDP 命令序号（实例级，勿用可变默认参数共享）
+        # 审计修复 #20：RLock —— 公开入口 @synchronized 串行整个
+        # "发送→收应答" 过程；同线程嵌套（…_if_active→wait_page_ready）可重入。
+        self._lock = threading.RLock()
 
     # -------------------------------------------------- 生命周期 --
     def _binary(self) -> str | None:
@@ -240,11 +282,13 @@ class WebAutomation:
         self._target_id = target.get("id")
         self._ws = _WebSocket(target["webSocketDebuggerUrl"])
 
+    @_synchronized
     def close(self) -> None:
         if self._ws is not None:
             self._ws.close()
             self._ws = None
 
+    @_synchronized
     def close_browser(self) -> dict:
         """CDP Browser.close 优雅关闭自动化浏览器。
 
@@ -272,18 +316,18 @@ class WebAutomation:
         return {"closed": False, "note": "关闭命令已发出但端口仍在，稍后自动退出"}
 
     # -------------------------------------------------- CDP 命令 --
-    def _cmd(self, method: str, params: dict | None = None,
-             _id: list[int] = [0]) -> dict:
+    def _cmd(self, method: str, params: dict | None = None) -> dict:
         if self._ws is None:
             raise CDPError("命令通道未连接")
-        _id[0] += 1
+        self._msg_id += 1
+        req_id = self._msg_id
         try:
             self._ws.send_text(json.dumps(
-                {"id": _id[0], "method": method, "params": params or {}}))
+                {"id": req_id, "method": method, "params": params or {}}))
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 msg = json.loads(self._ws.recv_text())
-                if msg.get("id") == _id[0]:
+                if msg.get("id") == req_id:
                     if "error" in msg:
                         raise _CmdError(f"{method}: {msg['error']}")
                     return msg.get("result") or {}
@@ -296,6 +340,7 @@ class WebAutomation:
             raise CDPError(f"CDP 通信异常: {type(e).__name__}: {e}") from e
 
     # -------------------------------------------------- 高层操作 --
+    @_synchronized
     def open_url(self, url: str) -> dict:
         """在自动化浏览器中打开网页并等待加载完成。"""
         self._ensure_locked(url)
@@ -329,6 +374,7 @@ class WebAutomation:
             pass                        # 清理失败不影响打开页面本身
         return self.state()
 
+    @_synchronized
     def find(self, text: str = "", selector: str = "") -> dict | None:
         """按可见文本（子串）/CSS 选择器定位页面元素，返回描述。
 
@@ -379,6 +425,7 @@ class WebAutomation:
         raw = r.get("result", {}).get("value")
         return json.loads(raw) if raw else None
 
+    @_synchronized
     def click(self, text: str = "", selector: str = "", nth: int | None = None,
               retries: int = 3, interval: float = 0.6) -> dict:
         """定位并点击页面元素（真实输入事件）。
@@ -445,6 +492,7 @@ class WebAutomation:
             time.sleep(interval)
         return False
 
+    @_synchronized
     def state(self) -> dict:
         """当前页面 {url, title}（效果验证与审计用）。"""
         self._ensure_locked()
@@ -454,6 +502,7 @@ class WebAutomation:
             "returnByValue": True})
         return json.loads(r["result"]["value"])
 
+    @_synchronized
     def web_extract(self, max_chars: int = 3500) -> dict:
         """抽取当前页面：URL/标题/正文（截断）/前 20 个链接，供 LLM 解读。"""
         self._ensure_locked()
@@ -471,6 +520,80 @@ class WebAutomation:
         r = self._cmd("Runtime.evaluate", {"expression": js,
                                            "returnByValue": True})
         return json.loads(r["result"]["value"])
+
+    # -------------------------------------------------- 就绪等待 --
+    @_synchronized
+    def wait_page_ready(self, timeout: float = 8.0,
+                        settle: float = 0.4) -> dict:
+        """等待"页面正确显示"再返回（截图/点击前的就绪闸门）。
+
+        判据（缺一不可，任一拿不准都如实报未就绪，绝不假装成功）：
+          1. `Page.bringToFront` 把自动化窗口提到最前（否则截图可能拍到别的窗口）；
+          2. `document.readyState === 'complete'` 且**所有图片** complete；
+          3. 连等两帧 `requestAnimationFrame`（浏览器真正绘制过一帧）；
+          4. `document.body.innerText` 长度连续两次采样相同（异步渲染/结果列表
+             常在 complete 之后才填上，这才是"看起来已经显示好了"）。
+        背景：截图曾按固定 `time.sleep(2)` 抓屏，搜索结果页仍在渲染 → 拍出空白页。
+        """
+        self._ensure_locked()
+        t0 = time.monotonic()
+        try:
+            self._cmd("Page.bringToFront")
+        except CDPError:
+            pass                       # 提升窗口失败不影响后续等待
+        js = ("(async()=>{"
+              "for(let i=0;i<120;i++){"
+              " if(document.readyState!=='complete'){"
+              "   await new Promise(s=>setTimeout(s,100));continue;}"
+              " const imgs=[...document.images];"
+              " if(imgs.some(im=>!im.complete)){"
+              "   await new Promise(s=>setTimeout(s,100));continue;}"
+              " break;}"
+              "await new Promise(s=>requestAnimationFrame(()=>requestAnimationFrame(s)));"
+              "const imgs=[...document.images];"
+              "return {ready:document.readyState==='complete',"
+              " images:imgs.length,pending:imgs.filter(i=>!i.complete).length,"
+              " text_len:(document.body?document.body.innerText:'').length};})()")
+        r = self._cmd("Runtime.evaluate", {"expression": js, "awaitPromise": True,
+                                           "returnByValue": True})
+        info = (r.get("result") or {}).get("value") or {}
+        last = int(info.get("text_len") or 0)
+        stable = 0
+        while time.monotonic() - t0 < timeout:
+            time.sleep(settle)
+            try:
+                r2 = self._cmd("Runtime.evaluate", {
+                    "expression": "document.body?document.body.innerText.length:0",
+                    "returnByValue": True})
+            except CDPError:
+                break
+            now = int(((r2.get("result") or {}).get("value")) or 0)
+            if now == last and now > 0:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+            last = now
+        waited = round((time.monotonic() - t0) * 1000)
+        ready = bool(info.get("ready")) and int(info.get("pending") or 0) == 0
+        return {"ready": ready, "stable": stable >= 2, "text_len": last,
+                "waited_ms": waited,
+                "reason": ("页面已就绪且内容稳定" if ready and stable >= 2 else
+                           f"未完全稳定（ready={info.get('ready')}, "
+                           f"未完成图片={info.get('pending')}, 文本长度={last}）")}
+
+    @_synchronized
+    def wait_page_ready_if_active(self, timeout: float = 8.0) -> dict:
+        """只在自动化浏览器**已经在跑**时等待页面就绪。
+
+        关键：**不会为此去拉起浏览器** —— 纯桌面截图（没走过网页步骤）不该
+        因为截图而启动一个 Chromium。
+        """
+        if self._ws is None:
+            return {"ready": False, "skipped": True, "waited_ms": 0,
+                    "reason": "自动化浏览器未在运行，跳过页面就绪等待"}
+        return self.wait_page_ready(timeout=timeout)
 
 
 _AUTO: WebAutomation | None = None
@@ -494,15 +617,17 @@ def web_open(url: str) -> dict:
     if not isinstance(url, str) or not url.strip():
         return {"success": False, "error": "参数错误: url 不能为空"}
     url = url.strip()
-    if not url.startswith(("http://", "https://")):
+    if not url.lower().startswith(("http://", "https://")):
         return {"success": False,
                 "error": f"参数错误: 仅允许 http/https 链接，收到: {url[:50]}"}
     try:
         st = get_automation().open_url(url)
         return {"success": True, "result": {"opened": url, **st}}
     except CDPError as e:
-        return {"success": True, "result": f"[Mock] web_open({url}) — {e}",
-                "simulated": True}
+        # 通道不可用 = 动作没有真正发生：success 必须为 False（"失败必须可见"），
+        # degraded/simulated 标记供上层识别"降级而非真实失败"
+        return {"success": False, "simulated": True, "degraded": True,
+                "error": f"[Mock·未执行] web_open({url}) 浏览器通道不可用 — {e}"}
     except Exception as e:
         return {"success": False,
                 "error": f"web_open 失败: {type(e).__name__}: {e}"}
@@ -529,9 +654,8 @@ def web_click(text: str = "", selector: str = "", nth=None) -> dict:
     except _NotFoundError as e:
         return {"success": False, "error": str(e)}   # 浏览器活着，是真没找到
     except CDPError as e:
-        return {"success": True,
-                "result": f"[Mock] web_click({text!r}) — {e}",
-                "simulated": True}
+        return {"success": False, "simulated": True, "degraded": True,
+                "error": f"[Mock·未执行] web_click({text!r}) 浏览器通道不可用 — {e}"}
     except Exception as e:
         return {"success": False,
                 "error": f"web_click 失败: {type(e).__name__}: {e}"}
@@ -543,9 +667,8 @@ def web_state() -> dict:
         st = get_automation().state()
         return {"success": True, "result": st}
     except CDPError as e:
-        return {"success": True,
-                "result": {"url": "", "title": f"[Mock] {e}"},
-                "simulated": True}
+        return {"success": False, "simulated": True, "degraded": True,
+                "error": f"[Mock·未执行] web_state 浏览器通道不可用 — {e}"}
     except Exception as e:
         return {"success": False,
                 "error": f"web_state 失败: {type(e).__name__}: {e}"}
@@ -557,8 +680,8 @@ def web_extract(max_chars: int = 3500) -> dict:
         data = get_automation().web_extract(max_chars=int(max_chars or 3500))
         return {"success": True, "result": data}
     except CDPError as e:
-        return {"success": True, "result": f"[Mock] web_extract — {e}",
-                "simulated": True}
+        return {"success": False, "simulated": True, "degraded": True,
+                "error": f"[Mock·未执行] web_extract 浏览器通道不可用 — {e}"}
     except Exception as e:
         return {"success": False,
                 "error": f"web_extract 失败: {type(e).__name__}: {e}"}
@@ -609,9 +732,8 @@ def web_search(query: str, engine: str = "bing") -> dict:
         return {"success": True,
                 "result": {"query": query.strip(), "engine": engine, **st}}
     except CDPError as e:
-        return {"success": True,
-                "result": f"[Mock] web_search({query!r}) — {e}",
-                "simulated": True}
+        return {"success": False, "simulated": True, "degraded": True,
+                "error": f"[Mock·未执行] web_search({query!r}) 浏览器通道不可用 — {e}"}
     except Exception as e:
         return {"success": False,
                 "error": f"web_search 失败: {type(e).__name__}: {e}"}
@@ -668,7 +790,9 @@ WEB_SCHEMAS: dict[str, ToolSchema] = {
         description="点击网页元素：按元素可见文本子串定位（如按钮/链接文字），"
                     "点击前自动滚动到可见",
         parameters=[
-            ToolParam("text", ToolParamType.STRING, "元素可见文本（子串匹配）"),
+            ToolParam("text", ToolParamType.STRING,
+                      "元素可见文本（子串匹配）；与 selector/nth 三选一",
+                      required=False, default=""),
             ToolParam("selector", ToolParamType.STRING, "CSS 选择器（可选，提供时优先）",
                       required=False, default=""),
             ToolParam("nth", ToolParamType.NUMBER, "点击搜索结果第 n 条（与 web_search 配套）",
@@ -686,10 +810,12 @@ WEB_SCHEMAS: dict[str, ToolSchema] = {
 
 
 def register_web_tools(registry) -> None:
-    """把 web/answer 系工具注册进 ToolRegistry（幂等）。"""
+    """把 web/answer 系工具注册进 ToolRegistry（幂等：已注册则跳过）。"""
     for name, func in (("web_search", web_search), ("web_open", web_open),
                        ("web_click", web_click), ("web_state", web_state),
                        ("web_extract", web_extract), ("llm_answer", llm_answer),
                        ("web_close_browser", web_close_browser)):
+        if registry.has(name):
+            continue
         registry.register(name, func, WEB_SCHEMAS.get(name))
 

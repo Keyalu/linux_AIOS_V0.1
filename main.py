@@ -23,6 +23,8 @@ import json
 import os
 import shutil
 import sys
+import time
+import uuid
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -40,9 +42,12 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 # 任务书 七.2 演示场景表（GUI 场景在 Mock 后端下模拟执行，文件场景真实执行）
+# 注：任务书"场景4"为拖拽类动作，未纳入本演示矩阵；场景 2 用 /tmp ——
+# 任务书原路径 /home/user/Documents 本机不存在，且 navigate 现在只打开
+# **已存在**的目录（不再静默创建）。
 DEMO_SCENARIOS = [
     ("场景1 基础 GUI", "打开文件管理器"),
-    ("场景2 导航操作", "导航到 /tmp"),   # 任务书原路径 /home/user/Documents 本机不存在
+    ("场景2 导航操作", "导航到 /tmp"),
     ("场景3 按钮点击", "创建 project 文件夹"),
     ("场景5 窗口切换", "切换到浏览器"),
     ("场景6 复杂任务", "帮我把「demo_task」文件夹里的文件整理一下，顺便看看有没有重复文件，最后备个份"),
@@ -52,9 +57,29 @@ DEMO_SCENARIOS = [
 
 
 def prepare_sandbox(out: str = OUT) -> str:
-    """场景 6 的演示沙箱：含一对重复文件与多类型文件。"""
+    """场景 6 的演示沙箱：含一对重复文件与多类型文件。
+
+    重建前把上一轮沙箱挪进回收站（.aios_trash）而不是直接 rmtree ——
+    演示数据同样不该被无声销毁。回收站重名时**加随机后缀**，不删任何东西；
+    整段用 `except BaseException` 兜底：加固过的运行环境（safe-delete shim）
+    会让 `rmtree` 抛 `SystemExit`，而它不是 `Exception`，会穿透普通 except
+    把 build() 连带打死。
+    """
     sandbox = os.path.join(out, "demo_task")
-    shutil.rmtree(sandbox, ignore_errors=True)
+    if os.path.isdir(sandbox):
+        try:
+            from src.default_tools import TRASH_DIR
+            os.makedirs(TRASH_DIR, exist_ok=True)
+            dest = os.path.join(
+                str(TRASH_DIR),
+                f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}_demo_task_prev")
+            shutil.move(sandbox, dest)
+        except BaseException:
+            # 环境拦截/磁盘异常：退化为"就地清空"，且同样吞掉环境抛出的 SystemExit
+            try:
+                shutil.rmtree(sandbox, ignore_errors=True)
+            except BaseException:
+                pass
     os.makedirs(os.path.join(sandbox, "附件"), exist_ok=True)
     files = {"报告.docx": "A" * 300, "报告副本.docx": "A" * 300,
              "照片.jpg": "B" * 800, "notes.md": "# 笔记\n内容",
@@ -80,9 +105,22 @@ def build(out: str = OUT) -> SystemCoordinator:
     detector = ControlDetector()             # 组2 控件检测
     planner = TaskPlanner(schemas=catalog, detector=detector)
     agent = AppAgent(registry, skills)       # 组3
+    security = SecuritySandbox()             # 组5（四层安全）
+    # 第 3 层签名验证落地：把组4 的函数对象作为**数据**注入组5 登记，
+    # 组5 依然不 import 组4（遵守组间解耦纪律）
+    security.register_signatures(registry.functions())
+    security.register_signatures(skills.functions())
+    # 修复逻辑审计 #17：把"取注册表当前函数"的回调也注入（仍是数据注入，
+    # 组5 不 import 组4）—— 登记后有人偷换注册表对象同样能被核对出来
+    security.register_live_source(
+        lambda: {**registry.functions(), **skills.functions()})
+    # 修复逻辑审计 #12：统计账本同样是凭据出口（params 原样携带 password/
+    # api_key）—— 把组5 脱敏函数作为**数据**注入 stats（stats 不 import 组5），
+    # 逐笔 entry 落盘前统一过 mask_record。
+    stats.set_redactor(security.mask_record)
     coordinator = SystemCoordinator(
         host, planner, agent, detector=detector,
-        security=SecuritySandbox(), rag=RAGKnowledgeBase(os.path.join(out, "rag_traces.jsonl")),
+        security=security, rag=RAGKnowledgeBase(os.path.join(out, "rag_traces.jsonl")),
         audit_path=os.path.join(out, "audit_log.jsonl"),
         schemas_catalog=catalog, default_target=sandbox,
         artifact_dir=out)
@@ -101,6 +139,10 @@ def save_bundle(out: str, bundle: dict) -> None:
 def run_demo(out: str = OUT) -> int:
     """任务书演示场景表联调：逐场景跑通五组链路并打印结果矩阵。"""
     coordinator = build(out)
+    agent = coordinator.modules[3]
+    if getattr(agent, "confirmer", None) is None:
+        print("提示：非交互模式（agent.confirmer=None）→ 提权步骤按 auto_escalate "
+              "自动同意，审计里 confirm_mode 标记为 \"auto\"（不再伪装成用户已确认）")
     print("=" * 74)
     print("  Agent_OS_v1.0 五组集成联调（组1→组5安全→组2→组3→组4←→组5审计/RAG）")
     print("=" * 74)

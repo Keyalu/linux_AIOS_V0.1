@@ -2,6 +2,13 @@
 
 四类高频扩展的逐步配方。通用前置：改完 `111/` 根目录的源后，同步到 `Agent_OS_v1.0/`（本次会话曾因漏同步返工），清 `__pycache__`，重启 8788。
 
+> **只改 `group_*/` 与 `src/` 下的实现**：项目根的 `host_agent.py`、`task_planner.py` 与 `group_1/task_planner.py` 是**零导入点的历史副本**，改它们没有任何效果（见 `docs/bugFix.md` §6）。
+
+> **新增动作/工具时的三道同步**（2026-09-15 补）：
+> ① 组1 `_RULES` + `_CATEGORIES` + `_SYSTEM_PROMPT` 动作表；
+> ② 组2 `_SKILL_ACTIONS`/`_TOOL_ACTIONS`/`_GUI_ACTIONS` 映射，**并判断是否要进 `_PATH_FALLBACK`（缺参时可否用工作区目标填充）与 `HostAgent._TARGET_MODE`（解析不出时的行为：workspace/anchor/strict）**；
+> ③ **安全层**：若动作会落盘/外发/读敏感文件，把它的动作名加进 `group_5/security.py` 与 `src/default_tools.py` 的 `_MUTATING_ACTIONS` / `_SENSITIVE_READ_ACTIONS`（两份口径必须逐字一致，`tests/test_regression_audit.py::test_policy_parity_between_groups` 会断言）。
+
 ## 配方 1：组4 加新工具
 
 1. 实现函数（`src/default_tools.py` 或 `src/real_tools.py`）：

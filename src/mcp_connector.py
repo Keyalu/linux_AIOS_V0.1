@@ -72,10 +72,13 @@ def _real_search(query: str) -> str | None:
         html, re.S | re.I)
         # 逐条剥掉 HTML 标签并去重，最多取前 5 条
     lines = []
+    seen = set()
     for u, t in blocks:
         title = re.sub(r"<[^>]+>|<!--.*?-->", "", t).strip()
-        if not title or title in [l.split(" ", 1)[-1] for l in lines]:
+        # 去重键用标题本身：旧实现拿整行（"• 标题\n  url"）当匹配对象，恒不相等 → 去重失效
+        if not title or title in seen:
             continue
+        seen.add(title)
         url = "https://www.sogou.com" + u if u.startswith("/link") else u
         lines.append(f"• {title}\n  {url[:90]}")
         if len(lines) >= 5:
@@ -142,29 +145,43 @@ class MCPConnector:
         self._setup_mock_weather(registry)
         self._setup_mock_translate(registry)
 
-        # 在服务器清单里登记一个 Mock Server（GUI 连接管理页可见）
+        # 在服务器清单里登记一个 Mock Server（GUI 连接管理页可见）。
+        # 幂等：已登记就不覆盖（早期每次调用都把 tools_count 覆写回 3）
         server_id = "mock-server"
-        self.servers[server_id] = {
+        self.servers.setdefault(server_id, {
             "name": server_id,
             "config": {"mode": "mock"},
             "status": "connected",
             "tools_count": 3,
-        }
+        })
+
+    # 修复逻辑审计 #8（红线 11）：三工具的真实通道失败后**不得谎报成功** ——
+    # 与 web_*（web_automation）同口径：success=False + simulated + degraded，
+    # 示例文本放 result 仅供展示，绝不能被上层当事实。
+    @staticmethod
+    def _degraded(name: str, why: str, sample: str = "") -> dict:
+        return {"success": False, "simulated": True, "degraded": True,
+                "error": f"[Mock·未执行] {name} 真实通道不可用（{why}），"
+                        f"以下为离线示例、非真实结果",
+                "result": sample or f"[Mock·离线] {name} 无结果"}
 
     def _setup_mock_search(self, registry: IToolRegistry) -> None:
-        def mock_search(query: str, engine: str = "web") -> str:
+        def mock_search(query: str, engine: str = "web") -> dict | str:
             try:
                 real = _real_search(query)
                 if real:
                     return f"[真实·搜狗] {query}\n{real}"
-            except Exception:
-                pass
-            return f"[Mock·离线] 搜索 ({engine}): 找到 3 条 {query} 相关结果"
+            except Exception as e:
+                return self._degraded(
+                    f"mcp_search({query})", f"{type(e).__name__}: {e}",
+                    f"搜索 ({engine}): 找到 3 条 {query} 相关结果")
+            return self._degraded(f"mcp_search({query})", "无真实结果返回",
+                                  f"搜索 ({engine}): 找到 3 条 {query} 相关结果")
         # Week3 加固：已注册则跳过，保证重复调用 register_mock_tools 不崩溃
         if not registry.has("mcp_search"):
             registry.register("mcp_search", mock_search, ToolSchema(
                 name="mcp_search",
-                description="联网搜索（真实·搜狗；网络不可用时降级 Mock）",
+                description="联网搜索（真实·搜狗；网络不可用时如实降级失败（simulated/degraded 标记））",
                 parameters=[
                     ToolParam("query", ToolParamType.STRING, "搜索关键词"),
                     ToolParam("engine", ToolParamType.STRING, "搜索引擎",
@@ -173,18 +190,20 @@ class MCPConnector:
             ))
 
     def _setup_mock_weather(self, registry: IToolRegistry) -> None:
-        def mock_weather(city: str, days: int = 1) -> str:
+        def mock_weather(city: str, days: int = 1) -> dict | str:
+            sample = "天气: {city} 晴转多云, 18°C~28°C, 空气质量良".format(city=city)
             try:
                 real = _real_weather(city, days)
                 if real:
                     return f"[真实·Open-Meteo] {real}"
-            except Exception:
-                pass
-            return "[Mock·离线] 天气: {city} 晴转多云, 18°C~28°C, 空气质量良".format(city=city)
+                return self._degraded(f"mcp_weather({city})", "无真实结果返回", sample)
+            except Exception as e:
+                return self._degraded(
+                    f"mcp_weather({city})", f"{type(e).__name__}: {e}", sample)
         if not registry.has("mcp_weather"):
             registry.register("mcp_weather", mock_weather, ToolSchema(
                 name="mcp_weather",
-                description="查询城市天气（真实·Open-Meteo；网络不可用时降级 Mock）",
+                description="查询城市天气（真实·Open-Meteo；网络不可用时如实降级失败（simulated/degraded 标记））",
                 parameters=[
                     ToolParam("city", ToolParamType.STRING, "城市名"),
                     ToolParam("days", ToolParamType.NUMBER, "预报天数",
@@ -193,22 +212,21 @@ class MCPConnector:
             ))
 
     def _setup_mock_translate(self, registry: IToolRegistry) -> None:
-        def mock_translate(text: str, to_lang: str = "en") -> str:
+        def mock_translate(text: str, to_lang: str = "en") -> dict | str:
             try:
                 real = _real_translate(text, to_lang)
                 if real:
                     return f"[真实·MyMemory] {real}"
-            except Exception:
-                pass
-            samples = {
-                ("你好", "en"): "Hello",
-                ("Hello", "zh"): "你好",
-            }
-            return samples.get((text, to_lang), f"[Mock·离线] {text} -> {to_lang}")
+                return self._degraded(f"mcp_translate({text!r})",
+                                      "无真实结果返回", f"{text} -> {to_lang}")
+            except Exception as e:
+                return self._degraded(
+                    f"mcp_translate({text!r})", f"{type(e).__name__}: {e}",
+                    f"{text} -> {to_lang}")
         if not registry.has("mcp_translate"):
             registry.register("mcp_translate", mock_translate, ToolSchema(
                 name="mcp_translate",
-                description="文本翻译（真实·MyMemory；网络不可用时降级 Mock）",
+                description="文本翻译（真实·MyMemory；网络不可用时如实降级失败（simulated/degraded 标记））",
                 parameters=[
                     ToolParam("text", ToolParamType.STRING, "要翻译的文本"),
                     ToolParam("to_lang", ToolParamType.STRING, "目标语言",

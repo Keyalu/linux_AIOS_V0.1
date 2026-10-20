@@ -80,7 +80,13 @@ class ControlDetector:
                         except Exception:
                             continue
                         for j in range(min(n, self.max_children)):
-                            stack.append((self._child(obj, j), aname, depth + 1))
+                            try:
+                                kid = self._child(obj, j)
+                            except Exception:
+                                continue
+                            if kid is None:
+                                continue        # 总线抖动可能返回 None：静默丢枝会丢控件
+                            stack.append((kid, aname, depth + 1))
         except Exception:
             # 真实后端（pyatspi/atspi-gi）遍历异常：诚实返回空，由上层走
             # element_query 现场定位；绝不静默塞假元素（否则 find_element
@@ -166,10 +172,19 @@ class ControlDetector:
     # ---------------------------------------------------------- --
     @staticmethod
     def _simulated_elements() -> list[dict]:
-        """近似 GNOME 桌面快照（Mock）：字段结构与真实 AT-SPI 输出一致。"""
+        """近似 GNOME 桌面快照（Mock）：字段结构与真实 AT-SPI 输出**完全一致**
+        （app/role/name/bbox/depth 五键）。
+
+        早期版本只有 role/name/bbox 三键，前端把 app/depth 渲染成 undefined，
+        也违反了本模块自己声明的输出契约。
+        """
         return [
-            {"role": "push button", "name": "Files", "bbox": [64, 64, 96, 96]},
-            {"role": "push button", "name": "Firefox", "bbox": [200, 64, 96, 96]},
-            {"role": "push button", "name": "Text Editor", "bbox": [336, 64, 96, 96]},
-            {"role": "frame", "name": "primary-desktop", "bbox": [0, 0, 1920, 1080]},
+            {"app": "gnome-shell", "role": "push button", "name": "Files",
+             "bbox": [64, 64, 96, 96], "depth": 2},
+            {"app": "gnome-shell", "role": "push button", "name": "Firefox",
+             "bbox": [200, 64, 96, 96], "depth": 2},
+            {"app": "gnome-shell", "role": "push button", "name": "Text Editor",
+             "bbox": [336, 64, 96, 96], "depth": 2},
+            {"app": "gnome-shell", "role": "frame", "name": "primary-desktop",
+             "bbox": [0, 0, 1920, 1080], "depth": 1},
         ]

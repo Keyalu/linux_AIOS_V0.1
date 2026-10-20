@@ -22,9 +22,13 @@ def raw(method, path, body=None, timeout=240):
     s.settimeout(timeout)
     s.connect(("127.0.0.1", PORT))
     payload = json.dumps(body).encode() if body is not None else None
-    headers = f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    # 审计修复 #16 同步：同源闸门现在要求 Origin 必带且同源 ——
+    # 体检脚本模拟浏览器的本地同源 JSON 请求（Host 带端口、Origin 同源）。
+    headers = f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n"
     if payload is not None:
-        headers += f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+        headers += (f"Content-Type: application/json\r\n"
+                    f"Origin: http://127.0.0.1:{PORT}\r\n"
+                    f"Content-Length: {len(payload)}\r\n")
     headers += "Connection: close\r\n\r\n"
     s.sendall(headers.encode() + (payload or b""))
     buf = b""

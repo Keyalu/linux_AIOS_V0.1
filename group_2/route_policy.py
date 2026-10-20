@@ -11,8 +11,9 @@ open_url/web_open）之间会猜错——提示词散文无法穷举这类歧义
    → 必须选"可产出数据"的通道（如 mcp_search）；
 2. 无消费证据 → 选"可观测"通道（如 web_search，用户能看到结果页）；
 3. 参数形态：open_url 的 url 不像网址 → 实为搜索关键词 → web_search；
-4. 后续家族：之后有 web_click/web_state（自动化浏览器内交互）→ 需在自动化
-   浏览器里打开（open_url → web_open），否则点击无处着力。
+4. 后续家族：之后有 web_click/web_state/web_extract（都在**自动化浏览器**里
+   取页）→ 需在自动化浏览器里打开（open_url → web_open），否则点击无处着力、
+   抽取拿到的是空白/陈旧页面。
 
 改写留 route_reason（步骤级）+ 汇总进 plan["routes"]（审计）；新动作加入
 语义近邻组时必须同步这里的决策表（见 recipes 配方 7）。
@@ -24,7 +25,10 @@ import re
 
 # 语义近邻歧义组：组内动作互为通道替代，改写只发生在组内
 _SEARCH_GROUP = ("web_search", "mcp_search", "search")
-_WEB_INTERACT = ("web_click", "web_state")   # 需在自动化浏览器内承接的步骤
+# 修复逻辑审计 #23：web_extract 与 web_click/web_state 同族 —— 它读的是
+# **自动化浏览器当前页**，不在 _WEB_INTERACT 家族里时，
+# [open_url(http) → web_extract] 不改 web_open，抽取落在未打开的通道上必空。
+_WEB_INTERACT = ("web_click", "web_state", "web_extract")
 _PAGE_CONSUMERS = _WEB_INTERACT              # 消费方要的是"页面"而非数据
 
 
@@ -83,9 +87,13 @@ def _has_web_interact_after(steps: list[dict], idx: int) -> bool:
 
 def _required_ok(action: str, params: dict,
                  schemas: dict | None) -> bool:
-    """改写后目标动作的必需参数是否齐备（缺参则不改写，宁缺毋滥）。"""
+    """改写后目标动作的必需参数是否齐备（缺参则不改写，宁缺毋滥）。
+
+    无 schema 目录时**不允许改写**：早期返回 True，等于在没有能力清单的
+    情况下也敢换动作，可能换成一个根本不存在的工具。
+    """
     if not schemas:
-        return True
+        return False
     schema = schemas.get(action)
     if not schema:
         return False                          # 目标动作不在能力清单里 → 不改写
@@ -94,8 +102,15 @@ def _required_ok(action: str, params: dict,
 
 
 def apply_route_policy(intent_text: str, steps: list[dict],
-                       schemas: dict | None = None) -> list[dict]:
-    """对规划步骤做通道改写（原位修改），返回改写记录供 plan["routes"] 审计。"""
+                       schemas: dict | None = None,
+                       channel_stats: dict | None = None) -> list[dict]:
+    """对规划步骤做通道改写（原位修改），返回改写记录供 plan["routes"] 审计。
+
+    channel_stats（优化方案 2.1，数据注入）：src.experience.channel_stats 的
+    产物 {action: {n, fail_rate,...}}。**只注记不改道** —— 改写目标仍由上方
+    硬规则决定（红线 3），经验只往 route_reason 追加"近期失败率"警示，
+    让确认面板/事件流如实呈现该通道的历史表现。
+    """
     consumed = consumed_by(steps)
     routes: list[dict] = []
     for idx, s in enumerate(steps):
@@ -138,6 +153,14 @@ def apply_route_policy(intent_text: str, steps: list[dict],
                     and _looks_like_url(url):
                 params["url"] = "https://" + url   # 裸域名补协议（不做会报参数错误）
 
+        # 改写成 web_open 的同样要补协议（此前只对"原本就是 web_open"的步骤
+        # 生效，[open_url(裸域名)→web_extract] 场景评测现场抓到）
+        if new_action == "web_open":
+            params["url"] = str(params.get("url") or target or "").strip()
+            if params["url"] and not params["url"].lower().startswith(
+                    ("http://", "https://")):
+                params["url"] = "https://" + params["url"]
+
         if new_action and new_action != action:
             if _required_ok(new_action, params, schemas):
                 s["action"] = new_action
@@ -150,4 +173,15 @@ def apply_route_policy(intent_text: str, steps: list[dict],
             else:
                 s["route_reason"] = \
                     f"未改写 {action}→{new_action}：目标动作缺少必需参数"
+
+        # 经验警示注记（优化方案 2.1）：样本足够且失败率高才提示；不改道
+        if channel_stats:
+            watched = s.get("action")
+            st = channel_stats.get(watched) or {}
+            if st.get("n", 0) >= 3 and st.get("fail_rate", 0) >= 0.5:
+                warn = (f"⚠ 经验警示：近 {st['n']} 次 {watched} 通道"
+                        f"失败率 {round(st['fail_rate'] * 100)}%")
+                s["route_reason"] = (f"{s['route_reason']}；{warn}"
+                                     if s.get("route_reason") else warn)
+                s["route_warning"] = True
     return routes

@@ -114,15 +114,18 @@ class ToolRegistry(IToolRegistry):
             duration = (time.monotonic() - start) * 1000
 
             if isinstance(raw, dict) and "success" in raw:
-                # 统一契约键 success/result/error 之外的键（如 simulated）
-                # 收进 extra，避免 **raw 解包时 TypeError
-                result = ToolResult(
-                    success=bool(raw["success"]),
-                    result=raw.get("result"),
-                    error=raw.get("error"),
-                    extra={k: v for k, v in raw.items()
-                           if k not in ("success", "result", "error")},
-                ) if raw["success"] else ToolResult.fail(raw.get("error", "未知错误"))
+                # 统一契约键 success/result/error 之外的键（如 simulated/degraded）
+                # 收进 extra，避免 **raw 解包时 TypeError。
+                # 修复逻辑审计 #9：**失败分支同样保留 result 与全部 extra** ——
+                # 上游按红线 11 打的降级标记、partial 明细不能被契约层吞掉。
+                extra = {k: v for k, v in raw.items()
+                         if k not in ("success", "result", "error")}
+                err = raw.get("error")
+                if not raw["success"] and not err:
+                    err = "未知错误"
+                result = ToolResult(success=bool(raw["success"]),
+                                    result=raw.get("result"),
+                                    error=err, extra=extra)
             else:
                 result = ToolResult.ok(raw)
 
@@ -171,6 +174,11 @@ class ToolRegistry(IToolRegistry):
     # 存在性快查（MCP 注册幂等检查、组3 自愈流用）
     def has(self, name: str) -> bool:
         return name in self._tools
+
+    # 已注册函数快照：组5 第 3 层"签名核对"用 —— 编排层把函数对象作为
+    # **数据**注入，组5 不需要 import 组4 的业务代码（组间解耦纪律）
+    def functions(self) -> dict[str, ToolFunc]:
+        return dict(self._tools)
 
     # 取单个工具的说明书
     def get_schema(self, name: str) -> ToolSchema | None:

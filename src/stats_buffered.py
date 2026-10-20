@@ -8,6 +8,12 @@ stats_buffered.py — 高压场景优化版统计模块（Week3 方案演示）
 
 接口与 ToolStats 完全一致，可无缝替换：
     stats = BufferedToolStats(log_path="stats.json")   # 替代 ToolStats
+
+修复逻辑审计 #19：兑现"无缝替换"承诺 —— 原版与 ToolStats 行为分叉三处：
+① 无 _load()（重启不从磁盘续账，"跨运行累积账本"语义丢失）；
+② flush 用内存 counters **覆盖**文件（重启后归零再写回，历史统计被抹）；
+③ clear() 后 _unsaved 为空，_flush_locked 早退**不落盘**（重置只改了内存，
+   文件仍是旧账）。现全部对齐，并同步 ToolStats 的 set_redactor 脱敏钩子。
 """
 
 from __future__ import annotations
@@ -42,6 +48,28 @@ class BufferedToolStats(IToolStats):
         self._counters: dict[str, dict[str, int]] = {}
         self._last_flush = time.monotonic()
         self._lock = threading.Lock()
+        # 与 ToolStats 同款的入库脱敏钩子（审计 #12/#19：无缝替换必须含它，
+        # 否则换过来就是一个凭据明文旁路）。
+        self._redactor = None
+        # 审计 #19①：与 ToolStats 一致 —— 传入 log_path 即从磁盘续账
+        if log_path:
+            self._load()
+
+    def set_redactor(self, fn) -> None:
+        """注入入库脱敏回调（如组5 SecuritySandbox.mask_record）。"""
+        self._redactor = fn if callable(fn) else None
+
+    def _load(self) -> None:
+        try:
+            with open(self._log_path, encoding="utf-8") as f:
+                data = json.load(f)
+            self._records = data.get("records", [])[-self._max_records:]
+            self._counters = data.get("counters", {})
+        # 首次运行/账本损坏 → 从零开始（与 ToolStats 同口径，不拖垮调用方）
+        except (FileNotFoundError, OSError, json.JSONDecodeError,
+                UnicodeDecodeError):
+            self._records = []
+            self._counters = {}
 
     # ----------------------------------------------------------
     # 核心记录（O(1)，只在达到阈值时才碰磁盘）
@@ -57,6 +85,12 @@ class BufferedToolStats(IToolStats):
         }
         if record.error:
             entry["error"] = record.error
+        if self._redactor is not None:
+            # 与 ToolStats 同口径：脱敏失败不拖垮记账
+            try:
+                entry = self._redactor(entry)
+            except Exception:
+                pass
 
         # 锁内完成：明细环形截断 + 聚合计数 + 待落盘缓冲 + 阈值判断
         with self._lock:
@@ -87,39 +121,49 @@ class BufferedToolStats(IToolStats):
             if self._log_path:
                 self._flush_locked()
 
-    def _flush_locked(self) -> None:
-        """原子写入。注意：在持有锁的状态下调用。"""
-        if not self._unsaved:
+    def _flush_locked(self, force: bool = False) -> None:
+        """增量落盘。注意：在持有锁的状态下调用。
+
+        审计 #19③：force=True 时空缓冲也要落盘（clear 之后必须把空账本
+        写回文件，否则"重置"只发生在内存，重启后旧账复活）。
+        """
+        if not self._unsaved and not force:
             self._last_flush = time.monotonic()
             return
         try:
-            # 增量追加模式：只把未保存的条目写进去，不再全量重写
+            # 增量追加模式：只把未保存的条目写进去，不再全量重写。
+            # counters 用内存值覆盖是安全的 —— __init__ 已 _load() 续账
+            # （审计 #19② 的根因正是缺了续账）。
             existing = {"records": [], "counters": {}}
             if os.path.exists(self._log_path):
                 try:
                     with open(self._log_path, encoding="utf-8") as f:
                         existing = json.load(f)
-                except (json.JSONDecodeError, OSError):
-                    pass
+                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                    existing = {"records": [], "counters": {}}  # 坏账本自愈重写
 
             existing["records"] = (
                 existing.get("records", []) + self._unsaved
             )[-self._max_records:]
             existing["counters"] = self._counters
-            existing["updated"] = datetime.now().isoformat()
-
-            dir_name = os.path.dirname(self._log_path) or "."
-            with tempfile.NamedTemporaryFile(
-                "w", dir=dir_name, suffix=".tmp", delete=False, encoding="utf-8"
-            ) as f:
-                json.dump(existing, f, ensure_ascii=False)
-                tmp_path = f.name
-            os.replace(tmp_path, self._log_path)
+            self._write_ledger_locked(existing)
         except Exception:
             pass  # 落盘失败不影响主流程
         finally:
             self._unsaved.clear()
             self._last_flush = time.monotonic()
+
+    def _write_ledger_locked(self, data: dict) -> None:
+        """原子写账本（临时文件 + os.replace，UTF-8 钉死 —— 审计 #18 同款）。
+        调用方持锁。updated 时间戳在此统一补。"""
+        data = {**data, "updated": datetime.now().isoformat()}
+        dir_name = os.path.dirname(self._log_path) or "."
+        with tempfile.NamedTemporaryFile(
+            "w", dir=dir_name, suffix=".tmp", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(data, f, ensure_ascii=False)
+            tmp_path = f.name
+        os.replace(tmp_path, self._log_path)
 
     # ----------------------------------------------------------
     # 查询接口（与 ToolStats 完全一致）
@@ -160,5 +204,10 @@ class BufferedToolStats(IToolStats):
             self._records.clear()
             self._counters.clear()
             self._unsaved.clear()
+            # 审计 #19③：重置必须落盘 —— 旧实现 _flush_locked 因缓冲为空
+            # 直接早退，文件仍是旧账，且下一次续账(_load)后旧统计复活。
             if self._log_path:
-                self._flush_locked()
+                try:
+                    self._write_ledger_locked({"records": [], "counters": {}})
+                except Exception:
+                    pass

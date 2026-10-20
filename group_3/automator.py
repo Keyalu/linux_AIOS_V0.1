@@ -70,17 +70,22 @@ class Automator:
             after = self.capture_state()
             if self.atspi:
                 after["windows"] = self.atspi.window_names()
+            # 未知操作 = 什么都没执行 → simulated 恒为 True（不再复用 not _REAL：
+            # 无 pyautogui 的 Linux 目标机上 _REAL=False，会把"失败"标成 simulated=False）
             return {"success": False, "error": f"未知操作: {action}",
                     "before_state": before, "after_state": after,
-                    "simulated": not _REAL}
+                    "simulated": True}
         out = handler(step, element_info, params)
         time.sleep(self.action_delay)
-        out.setdefault("success", True)
         out["before_state"] = before
         out["after_state"] = after = self.capture_state()
         if self.atspi:
             after["windows"] = self.atspi.window_names()
-        out.setdefault("simulated", not _REAL)
+        # 修复逻辑审计 #10（红线 11）：Mock 分支在下方各自显式标注
+        # success=False + simulated=True；此处默认值不再"缺省即成功"——
+        # 真实通道（AT-SPI/pyautogui）执行过的动作才算 simulated=False。
+        out.setdefault("success", True)
+        out.setdefault("simulated", False)
         return out
 
     # ---------------------------------------------------------- --
@@ -139,8 +144,9 @@ class Automator:
                 import pyautogui
                 pyautogui.click(x, y)
                 return {"message": f"点击({x},{y}){mark}", "coord_fix": fix_info}
-        return {"message": "[Mock] 点击（无可定位控件）", "simulated": True,
-                "mock": True}
+        return {"success": False, "mock": True, "simulated": True,
+                "message": "[Mock·未执行] 点击（无可定位控件）",
+                "error": "无可用点击通道（AT-SPI/pyautogui 均不可用），动作未真实发生"}
 
     def type_text(self, step, element_info, params):
         text = params.get("text", "")
@@ -169,7 +175,9 @@ class Automator:
             import pyautogui
             pyautogui.typewrite(text)
             return {"message": f"输入 {text!r}"}
-        return {"message": f"[Mock] 输入 {text!r}", "simulated": True}
+        return {"success": False, "mock": True, "simulated": True,
+                "message": f"[Mock·未执行] 输入 {text!r}",
+                "error": "无可用输入通道（AT-SPI/pyautogui 均不可用），文本未打入"}
 
     def hotkey(self, step, element_info, params):
         keys = params.get("keys", [])
@@ -180,18 +188,26 @@ class Automator:
             import pyautogui
             pyautogui.hotkey(*keys)
             return {"message": f"快捷键 {'+'.join(keys)}"}
-        return {"message": f"[Mock] 快捷键 {'+'.join(keys)}", "simulated": True}
+        return {"success": False, "mock": True, "simulated": True,
+                "message": f"[Mock·未执行] 快捷键 {'+'.join(keys)}",
+                "error": "无可用按键通道（AT-SPI/pyautogui 均不可用），快捷键未触发"}
 
     def drag(self, step, element_info, params):
         if self.atspi:
+            # 修复逻辑审计 #10：AT-SPI 通道只点了坐标、没有真实拖拽 ——
+            # "拖拽完成"是谎报，如实标注降级失败（点击已发生是副作用，注明）
             x, y = params.get("x", 400), params.get("y", 400)
             self.atspi.click_at(x, y)
-            return {"message": f"AT-SPI 点击({x},{y})"}
+            return {"success": False, "degraded": True,
+                    "message": f"AT-SPI 仅点击({x},{y})，拖拽未实现",
+                    "error": "拖拽动作未发生（该通道只执行了等效点击）"}
         if _REAL:
             import pyautogui
             pyautogui.dragTo(params.get("x", 400), params.get("y", 400), duration=0.4)
             return {"message": "拖拽完成"}
-        return {"message": "[Mock] 拖拽", "simulated": True}
+        return {"success": False, "mock": True, "simulated": True,
+                "message": "[Mock·未执行] 拖拽",
+                "error": "无可用输入通道（AT-SPI/pyautogui 均不可用），拖拽未发生"}
 
     # 中文口语名 → .desktop 名（gtk-launch 参数）。AT-SPI 坐标点击 dock 在
     # X11/Wayland 下对 GNOME Shell 不可靠，命令行启动最稳。
@@ -211,12 +227,20 @@ class Automator:
     @classmethod
     def _resolve_desktop(cls, app: str) -> str:
         """应用口语名 → .desktop 名。精确匹配优先；否则长关键词优先子串
-        匹配（避免 zcode 被 code 抢走）；都不中就原样返回。"""
+        匹配（避免 zcode 被 code 抢走）；都不中就原样返回。
+
+        **长度护栏**：命中关键词必须覆盖目标名主体
+        （len(a) <= max(len(kw),4)+1）。缺少护栏时 "我的文件报告" 会因含
+        "文件" 被解析成 nautilus —— 组2 的同名逻辑（_known_app_name）早已
+        加了该护栏，组3 此前未同步（审计复核 V-01）。
+        """
         a = (app or "").strip().lower()
+        if not a:
+            return ""
         if a in cls._APP_DESKTOP:
             return cls._APP_DESKTOP[a]
         for kw in sorted(cls._APP_DESKTOP.keys(), key=len, reverse=True):
-            if kw in a:
+            if kw in a and len(a) <= max(len(kw), 4) + 1:
                 return cls._APP_DESKTOP[kw]
         return (app or "").strip()
 
@@ -238,12 +262,26 @@ class Automator:
                             "launched": True, "simulated": False}
             except Exception:
                 pass
-        # 2) fallback：直接执行二进制（zcode 等非 .desktop 应用）
-        if shutil.which(desktop):
-            os.system(f"nohup {desktop} >/dev/null 2>&1 &")
-            return {"message": f"已启动 {desktop}", "simulated": False}
-        return {"message": f"[Mock] 启动应用 {app}（{desktop}）",
-                "simulated": True}
+        # 2) fallback：直接执行二进制（zcode 等无 .desktop 的应用）。
+        #    走 Popen(argv) 而非 os.system(拼字符串) —— 后者把 app 名拼进 shell
+        #    命令行，是命令注入面；且"which 命中即报已启动"属谎报（不校验进程）。
+        binary = shutil.which(desktop)
+        if binary:
+            try:
+                proc = subprocess.Popen(
+                    [binary], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as e:
+                return {"success": False, "simulated": False,
+                        "message": f"启动 {desktop} 失败: {type(e).__name__}: {e}"}
+            if proc.poll() is None:
+                return {"message": f"已启动 {desktop}（pid={proc.pid}）",
+                        "launched": True, "simulated": False}
+            return {"success": False, "simulated": False,
+                    "message": f"{desktop} 启动后立即退出（code={proc.returncode}）"}
+        return {"success": False, "mock": True, "simulated": True,
+                "message": f"[Mock·未执行] 启动应用 {app}（{desktop} 未安装/不在 PATH）",
+                "error": f"应用 {desktop} 未安装或不在 PATH，未产生任何窗口"}
 
     def _nautilus_showing(self, base: str) -> bool:
         """任一文件管理器窗口标题包含 base（Nautilus 标题=当前文件夹名）。"""
@@ -266,14 +304,21 @@ class Automator:
         return False
 
     def navigate(self, step, element_info, params):
-        """打开文件管理器并跳转到 path。
+        """打开文件管理器并跳转到 path（**只打开已存在的目录**）。
 
         三段式：GUI 键鼠链（Ctrl+L→键入→回车）优先 —— 这是对任务书
         "GUI 自动化"的展示；随后 AT-SPI 验证窗口标题，未生效自动 CLI
-        兜底（nautilus path）—— 键鼠落点受焦点影响不可靠，结果优先。"""
+        兜底（nautilus path）—— 键鼠落点受焦点影响不可靠，结果优先。
+        目录不存在时如实失败：早期实现会静默 os.makedirs，把"打开目录"
+        偷偷扩权成"创建目录"。
+        """
         path = (params.get("path") or step.get("target", "")).strip()
         if not path:
             return {"success": False, "error": "缺少要打开的路径"}
+        path = os.path.expanduser(path)
+        if not os.path.isdir(path):
+            return {"success": False, "verified": False,
+                    "error": f"目录不存在，未执行导航: {path}"}
         base = os.path.basename(path.rstrip("/")) or path
 
         # 1) 拉起/聚焦文件管理器（params.app 优先，缺省文件管理器）
@@ -295,15 +340,9 @@ class Automator:
             pyautogui.press("enter")
         time.sleep(1.5)
 
-        # 3) 验证 + 兜底：目标目录不存在时先创建（"打开目录"的合理语义），
-        #    再 CLI 兜底打开；创建被拒（如 /home/user 需 root）则如实失败
+        # 3) 验证 + 兜底：目标目录已在上方校验存在；CLI 兜底打开
         verified = self._nautilus_showing(base)
         fallback = False
-        if not verified:
-            try:
-                os.makedirs(path, exist_ok=True)
-            except OSError:
-                pass
         if not verified and shutil.which("nautilus"):
             subprocess.Popen(["nautilus", path], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL,

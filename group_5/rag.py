@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from collections import Counter
@@ -41,10 +42,16 @@ def _cosine(a: Counter, b: Counter) -> float:
 class RAGKnowledgeBase:
     """执行轨迹知识库：add_trace 入库，query 余弦检索 top-k。"""
 
-    def __init__(self, path: str | None = None):
-        """path：JSONL 落盘文件；不传则纯内存（单次演示用）。"""
+    def __init__(self, path: str | None = None, max_documents: int = 5000):
+        """path：JSONL 落盘文件；不传则纯内存（单次演示用）。
+
+        max_documents：内存中保留的轨迹上限（长期运行不无限膨胀；
+        与落盘文件无关，文件仍是全量追加）。
+        """
         self.path = path
+        self.max_documents = max(1, int(max_documents))
         self.documents: list[dict] = []
+        self._lock = threading.Lock()
         self._load()
 
     # ---------------------------------------------------------- --
@@ -58,6 +65,8 @@ class RAGKnowledgeBase:
             "result": result,
         }
         self.documents.append(doc)
+        if len(self.documents) > self.max_documents:
+            self.documents = self.documents[-self.max_documents:]
         self._append(doc)
         return doc
 
@@ -79,18 +88,30 @@ class RAGKnowledgeBase:
     def _load(self) -> None:
         if not self.path or not os.path.exists(self.path):
             return
+        # 逐行容错：单行损坏只丢那一行，不让整个知识库加载失败
         try:
             with open(self.path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
+                    if not line:
+                        continue
+                    try:
                         self.documents.append(json.loads(line))
-        except (OSError, json.JSONDecodeError):
-            pass                       # 知识库损坏不应拖垮编排主流程
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return                     # 读不到就当空库，不拖垮编排主流程
+        if len(self.documents) > self.max_documents:
+            self.documents = self.documents[-self.max_documents:]
 
     def _append(self, doc: dict) -> None:
+        """追加落盘。失败**不抛**：RAG 是旁路，写不进去也不能打断编排主流程。"""
         if not self.path:
             return
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with self._lock:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+        except OSError:
+            pass

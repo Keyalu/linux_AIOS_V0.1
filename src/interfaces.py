@@ -116,6 +116,10 @@ class ToolResult:
             d["result"] = self.result
         else:
             d["error"] = self.error
+            # 修复逻辑审计 #9：失败但携带明细（partial 结果 / 降级示例文本）
+            # 时如实透出，供前端与 LLM 参考答案，不再被契约层吞掉
+            if self.result is not None:
+                d["result"] = self.result
         if self.extra:
             d.update(self.extra)
         return d

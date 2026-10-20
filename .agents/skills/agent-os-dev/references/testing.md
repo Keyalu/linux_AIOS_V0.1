@@ -49,6 +49,43 @@ python3 tests/test_integration_v10.py
 
 已知容错：场景矩阵测试对真实 LLM 输出波动有一次重试；send_email 类测试不得真发网络邮件（dry_run/模拟）。
 
+## 无浏览器环境下的前端验证（2026-09-15 补，Windows 开发机实测可用）
+
+GUI 改动不能只靠"看代码"，也不一定非要起浏览器。两条成本极低的替代手段：
+
+### 1. JS 语法 + 纯函数行为：`node --check` + 抽函数 eval
+
+```bash
+python - <<'PY'   # 抽出 <script> 与目标函数
+h=open('gui/index.html',encoding='utf-8').read()
+js=h.split('<script>',1)[1].rsplit('</script>',1)[0]
+open('.node_chk.js','w',encoding='utf-8').write(js)              # 全脚本语法检查
+i=js.index('function stepOutputMd'); j=js.index('async function runStaged')
+open('.node_fn.js','w',encoding='utf-8').write(js[i:j])          # 单个纯函数
+PY
+node --check .node_chk.js                                       # ★ 真的能拦下语法错误
+node -e "eval(require('fs').readFileSync('.node_fn.js','utf8')); console.log(stepOutputMd(fakeSess))"
+```
+`node --check` 在 2026-09-15 真拦下一处"模板字符串 + 普通字符串拼接"的语法错误 —— 只读代码看不出来。
+用完删掉 `.node_chk.js` / `.node_fn.js`（本机 `rm` 被 safe-delete shim 拦，用 python 删）。
+
+### 2. 接口链路：原始 socket 打运行中的服务（不依赖 curl/浏览器）
+
+`docs/bugFix.md` §4.1 与 §9.3 的冒烟就是这么做的：`socket.sendall("POST /api/chat HTTP/1.1 …")`
+逐条断言状态码/SSE 正文，覆盖 **CSRF 三路拒绝**、`/api/chat` 的路由判定、
+`/api/plan → /api/execute → /api/run` 全链路终态。
+
+两个必备技巧：
+- **临时挪开 `system_out/settings.json` 与 `llm_config.json`**：前者里的工作区可能是
+  Linux 路径（会被 `makedirs` 到本机），后者会让冒烟意外发起真实 LLM 调用；跑完原样还原。
+- 需要"确定性通道"时给子进程设 `AGENT_OS_LLM_CONFIG=/nonexistent`（组1 走规则引擎）。
+
+### 3. 前端状态类改动（聊天记录、页签）的断言方式
+
+无法 headless 跑 DOM，就断言**不变量**而不是行为：例如"清空动作只出现在 `clearChat` 里"
+（`html.count('对话已清空')==1`）、"首次回填有 `if(CHAT_SYNCED)return;` 护栏"、
+"本地已有内容时不覆盖"。见 `tests/test_regression_audit.py::TestChatHistoryAndRendering`。
+
 ## 服务管理
 
 | 服务 | 端口 | 启动 | 说明 |

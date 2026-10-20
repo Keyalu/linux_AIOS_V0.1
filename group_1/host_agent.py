@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -22,34 +23,33 @@ import urllib.request
 import uuid
 
 from src import llm_client   # 修复/生成类 LLM 调用共用同一配置源（便于测试替身）
+from src.intent_cache import TTLCache, cache_key   # 优化方案 3.1：LLM 意图缓存
+# 优化方案 1.3：类别表/标识符别名表收敛到 src/capabilities.py 单一命名空间，
+# 此处只是**派生视图的别名**（红线 17 的"四处同步"改为一表派生 + 守卫测试）。
+from src.capabilities import (CATEGORIES as _CATEGORIES,
+                              ACTION_ALIASES as _ACTION_ALIASES)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------- --
 # 规则词典（Mock 路径）：意图类别 / 动作 / 参数抽取
 # ---------------------------------------------------------------- --
-
-_CATEGORIES = {
-    "organize": "文件操作", "find_duplicates": "文件操作", "backup": "文件操作",
-    "find_large_files": "文件操作", "find_files": "文件操作",
-    "cleanup_temp": "文件操作", "delete_file": "文件操作",
-    "disk_usage": "系统设置", "system_check": "系统设置",
-    "open_url": "应用控制", "open_app": "应用控制", "click_element": "应用控制",
-    "send_email": "应用控制",
-    "navigate": "应用控制", "switch_window": "应用控制", "create_folder": "应用控制",
-    "weather": "信息查询", "search": "信息查询", "translate": "信息查询",
-    "web_search": "信息查询", "web_open": "应用控制", "web_click": "应用控制",
-    "web_state": "信息查询", "web_extract": "信息查询", "answer": "信息查询",
-    "web_close_browser": "应用控制",
-}
+# _CATEGORIES / _ACTION_ALIASES 见文件头：由 src/capabilities.CAPABILITIES 派生
+# （审计 #24 的教训——它们曾与组2 映射表/提示词各自手抄一份，漏一处即失联）。
 
 # (正则, 动作, 描述) —— 顺序即优先级，靠前的更具体
 _RULES: list[tuple[str, str, str]] = [
     (r"天气", "weather", "查询城市天气"),
     (r"翻译", "translate", "翻译文本"),
+    # 截屏/写入/执行命令三条让规则路径与提示词动作表对齐（离线也能用）；
+    # 位置靠前以便在 span 重叠时优先于泛化的"打开/保存"类规则
+    (r"截屏|截图|截个屏|抓屏", "take_screenshot", "截屏保存为图片"),
+    (r"写入|写到|写一个|保存到|存到", "write_file", "把内容写入文件"),
+    (r"执行(?:一下)?(?:系统)?命令|运行命令|命令行", "run_command", "执行系统命令"),
     (r"联网搜索|上网查|搜个|搜一下|搜索(?!文件)", "web_search",
      "浏览器打开搜索结果页（数据链走 mcp_search）"),
     (r"网页(的)?内容|页面(的)?内容", "web_extract", "抽取当前网页内容"),
+    (r"网页状态|页面状态", "web_state", "查看自动化浏览器当前页面状态"),
     (r"关闭(自动化)?浏览器|退出(自动化)?浏览器", "web_close_browser", "优雅关闭自动化浏览器"),
     (r"告诉我|说说|介绍一下", "answer", "回答问题（LLM 解读数据）"),
     (r"总结|概括", "answer", "总结上一步结果（LLM）"),
@@ -61,8 +61,19 @@ _RULES: list[tuple[str, str, str]] = [
     (r"系统状态|体检|检查系统", "system_check", "检查系统状态"),
     (r"清理|清空", "cleanup_temp", "清理临时文件"),
     (r"删除|删掉", "delete_file", "删除文件或目录"),
+    # 修复逻辑审计 #24：复制/移动/读取/列目录此前无中文规则 —— LLM 不可用时
+    # 规则（Mock）路径解析不出这些动作，"把a复制到b"整体落空（红线 7 降级链断）
+    (r"复制|拷贝", "copy_file", "复制文件到指定位置"),
+    (r"移动到|移到|挪到|移动", "move_file", "移动文件到指定位置"),
+    (r"读取|读文件|读一下", "read_file", "读取文件内容"),
+    (r"列出|列一下|有哪些文件", "list_directory", "列出目录中的文件"),
+    (r"起草.{0,6}邮件|拟.{0,4}邮件|邮件草稿", "send_email",
+     "起草邮件（dry_run 仅预览，不真发）"),
     (r"发(一封)?邮件|发送邮件", "send_email", "发送电子邮件"),
-    (r"(发给|发送给|发到)\S*@\S+", "send_email", "把文件/内容发送给指定邮箱"),
+    # \s* 容错"发给 a@b.com"这类自然中文断句（旧规则紧贴邮箱，口语空格必失配）；
+    # "发送" 与 "给" 之间常夹着内容（"发送aaa给 x@qq.com"）→ 允许 ≤12 字夹层
+    (r"(?:发给|发送给|发到|抄送给)\s*\S*@\S+|发送[^，。；,\s]{0,12}给\s*\S*@\S+",
+     "send_email", "把文件/内容发送给指定邮箱"),
     (r"打开(网址|网页)|访问", "open_url", "打开网页"),
     (r"导航|前往|去到", "navigate", "在文件管理器中导航到路径"),
     (r"切换到|切换窗口|切到", "switch_window", "切换应用窗口"),
@@ -78,10 +89,145 @@ _RULES: list[tuple[str, str, str]] = [
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
 _QUOTE_RE = re.compile(r"[「'\"]([^」'\"]+)[」'\"]")
+# 只认"像路径"的形态：绝对路径或 ~/ 开头（裸文件名歧义太大，不猜）
+_PATH_RE = re.compile(r"(~?/(?:[\w.\-\u4e00-\u9fa5]+/?)+)")
+
+
+def _is_abs_any(p) -> bool:
+    """跨平台"绝对路径"判定。
+
+    POSIX 风格前导 "/" 在 Windows 上 `os.path.isabs()` 返回 **False**，而
+    `os.path.join()` 又会把它当绝对路径（丢弃前一段）—— 两个内置函数的判定
+    不一致，会让"绝对但父目录不存在 → 丢弃/回填"的两道防线在 Windows 上
+    静默失效。这里显式把 前导 /、前导 \\、盘符 都算绝对。
+    """
+    s = str(p or "")
+    return bool(os.path.isabs(s) or s.startswith(("/", "\\"))
+                or re.match(r"^[a-zA-Z]:", s))
+
+
+def _is_fs_root(p) -> bool:
+    """是否文件系统根目录：'/'、'\'、盘符根（C: / C:/）——这些路径的
+    basename 为空串，任何"名字有话中依据"类校验对它们恒真/恒假，须单独拦。"""
+    s = str(p or "").replace("\\", "/").rstrip("/")
+    return s in ("", "/") or bool(re.fullmatch(r"[a-zA-Z]:", s))
+
+
+# "只做草稿、不真发"的话语特征：命中则 send_email 走 dry_run（干跑预览）。
+# 单点定义 —— 早期这条正则在 _extract_params 与 _finalize_intent 里各抄一份，
+# 顺序还不一致，且都漏了"起草"，导致「起草一封邮件发给 x@y.com」会被真的发出去。
+_DRAFT_RE = re.compile(r"草稿|起草|草拟|拟稿|只预览|仅预览|只做预览|不要发送|"
+                       r"先别发|先不要发|先不发|暂时别发|不用发|不要真发|"
+                       r"别真发|先看看")
+
+
+def _ensure_params(node: dict) -> dict:
+    """取节点的 params 字典；LLM 输出 `params: null`（合法 JSON）时重建。
+
+    修复逻辑审计 #22：`setdefault("params", {})` 对"键存在值为 null"返回
+    None，后续 `[k]=v` 直接 TypeError —— 且崩在 _finalize_intent（try 只包
+    _llm_intent），整轮编排 failed。"""
+    p = node.get("params")
+    if not isinstance(p, dict):
+        p = {}
+        node["params"] = p
+    return p
+
+
+def _norm_dry_run(params: dict, draft_only: bool) -> None:
+    """dry_run 保守单向归一：规则或 LLM 任一判"草稿"即干跑（审计 #21）。"""
+    llm_dry = params.get("dry_run")
+    if isinstance(llm_dry, str):
+        llm_dry = llm_dry.strip().lower() in ("true", "1", "yes")
+    params["dry_run"] = bool(draft_only or llm_dry)
+
+
+def _is_under(path: str, base: str) -> bool:
+    """path 是否位于 base 之下（先做分隔符归一）。
+
+    直接用 `path.startswith(base + "/")` 在 Windows 上恒不成立（base 含 "\\"），
+    会把"工作区内"的正常子路径误判成越界并压回根目录（复核 P2-34）。
+    """
+    p = str(path or "").replace("\\", "/").rstrip("/")
+    b = str(base or "").replace("\\", "/").rstrip("/")
+    return bool(b) and (p == b or p.startswith(b + "/"))
+
+
+def _extract_path(text: str) -> str:
+    """从话语里抽路径：引号包裹优先，其次 ~/ 或 / 开头的路径，抽不到返回 ""。"""
+    q = _QUOTE_RE.search(text or "")
+    if q:
+        cand = q.group(1).strip(" ，。、")
+        if cand:
+            return cand
+    m = _PATH_RE.search(text or "")
+    return m.group(1).rstrip("/") if m else ""
+
+
+# 分句切分：标点 + 顺序连接词。多目标指令里非主目标的抽参只在**自己所属
+# 分句**内进行（修复逻辑审计 #2：整句抽参时 _extract_path 取全句第一个
+# 路径/引号，"整理「报告.docx」再删除「临时.txt」" 会删错对象）。
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[，。；;！？!?]|(?:然后|紧接着|接着|接下来|然后?再|再(?:把|去|来|将|看)|"
+    r"最后|顺便|同时|之后)")
+
+
+def _clause_for(text: str, pos: int) -> str:
+    """返回包含 pos 位置的分句；pos 越界或切分失败时回退整句。"""
+    if not text or not (0 <= pos < len(text)):
+        return text
+    starts = [0]
+    for m in _CLAUSE_SPLIT_RE.finditer(text):
+        starts.append(m.end())
+    starts.append(len(text))
+    starts = sorted(set(starts))
+    for i in range(len(starts) - 1):
+        if starts[i] <= pos < starts[i + 1]:
+            seg = text[starts[i]:starts[i + 1]].strip()
+            return seg or text
+    return text
+
+
+# "裸动作标识符 → 规范中文说法"表 _ACTION_ALIASES：见文件头，由
+# src/capabilities.CAPABILITIES 派生（保序：_canonical_phrase 首个命中即返回，
+# 派生顺序 == 原手抄顺序，行为不变）。收录标准不变：动作**有对应中文规则**
+# 才收 —— 换成说法后要能被规则表解析回来（守卫测试逐条断言该不变式）；
+# 无规则、无必填参数说明的能力仍交由 src/capability_hints.py 给确定性提示。
+
+
+# 整条消息就是一个"动作标识符"（可带 执行/运行/启动… 前缀与括号参数）。
+# 前缀表与 src/capability_hints.py 的同名正则保持一致：两处都判"这是不是一个裸名字"。
+_BARE_ACTION_RE = re.compile(
+    r"^\s*(?:请|帮我|帮忙|麻烦|执行|运行|调用|启动|打开|跑|来一下|走一下|"
+    r"start|run|exec)?\s*[：:，,]?\s*"
+    r"([a-zA-Z][a-zA-Z0-9_]{3,})\s*(?:[（(].*[)）])?\s*$")
+
+
+def _bare_action_name(text: str) -> str:
+    """整条消息就是"某个动作标识符"（可带 执行/运行 前缀）时返回该标识符，否则 ""。"""
+    m = _BARE_ACTION_RE.match(text or "")
+    return m.group(1) if m else ""
+
+
+def _canonical_phrase(text: str) -> str:
+    """把"裸动作标识符"换成规范说法；不认返回 ""。
+
+    要求标识符**独立成词**（前后不是字母/数字/下划线/点），这样
+    `read_file.txt` 这类"提到文件名"不会被误当成调用。
+    """
+    for name, phrase in _ACTION_ALIASES.items():
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w.])", text, re.I):
+            return phrase
+    return ""
 
 
 def _match_goals(text: str) -> list[dict]:
     """按词典扫描多个动作；span 重叠时保留更具体的先命中项。"""
+    # 整条消息就是某个动作标识符（可带 执行/运行 前缀）→ 按标识符解析，
+    # **优先于规则表**：否则"运行 send_email"会被"运行"命中成 open_app。
+    bare = _bare_action_name(text)
+    if bare and bare in _ACTION_ALIASES:
+        return _match_goals(_ACTION_ALIASES[bare])
     hits: list[tuple[int, dict]] = []
     claimed: list[tuple[int, int]] = []
     for pattern, action, desc in _RULES:
@@ -91,10 +237,22 @@ def _match_goals(text: str) -> list[dict]:
         if any(st <= m.start() and m.end() <= en for st, en in claimed):
             continue                      # 命中位置被更具体的动作覆盖
         claimed.append((m.start(), m.end()))
-        hits.append((m.start(), {"action": action, "description": desc}))
+        hits.append((m.start(), {"action": action, "description": desc,
+                                 "_pos": m.start()}))
+    # 规则完全没命中时，再看是不是"只给了动作标识符"（system_check / disk_usage…）：
+    # 换成规范说法再解析一次。放在这里的好处是——对话卡片、CLI --text、
+    # 编排控制台、以及 LLM 规划前的规则预判，四条入口一次性都能认标识符。
+    if not hits:
+        canonical = _canonical_phrase(text)
+        if canonical:
+            return _match_goals(canonical)
     # 通用"找"只是兜底：已有更具体的文件目标时丢弃
     if len(hits) > 1 and any(g["action"] == "find_files" for _, g in hits):
         hits = [h for h in hits if h[1]["action"] != "find_files"] or hits
+    # "截个屏保存到 X"：截屏本身就是产出动作，write_file 只是同一动作的后果描述；
+    # 二者同时成 goal 会让工具把文本内容写进截图路径 —— 有截屏就丢弃写入
+    if len(hits) > 1 and any(g["action"] == "take_screenshot" for _, g in hits):
+        hits = [h for h in hits if h[1]["action"] != "write_file"] or hits
     # 目标按"话语中出现位置"排序 —— 用户说"先A再B再C"，计划就按 A→B→C
     # 排，而不是按规则表顺序（长指令曾因此步骤顺序全乱）
     return [g for _, g in sorted(hits, key=lambda x: x[0])]
@@ -121,8 +279,8 @@ def _extract_params(action: str, text: str) -> dict:
         b = re.search(r"(?:内容|正文)(?:是|为)?[「'\"]?([^，,。\n「'\"]+)", text)
         params["body"] = b.group(1).strip() if b else "(空)"
         # 明确说"发/发送"即真实发送（安全由 ADMIN 提权确认流把关）；
-        # "起草/只预览/先别发"才进入 dry_run
-        params["dry_run"] = bool(re.search(r"草稿|只预览|不要发送|先别发|别真发", text))
+        # "起草/草稿/只预览/先别发"等才进入 dry_run
+        params["dry_run"] = bool(_DRAFT_RE.search(text))
     elif action == "open_url":
         u = re.search(r"https?://\S+", text)
         params["url"] = u.group(0).rstrip("。，,") if u else ""
@@ -166,6 +324,60 @@ def _extract_params(action: str, text: str) -> dict:
             rest = text[m.end():].strip(" 的「」，,。：:。")
             if rest:
                 params["question"] = rest
+    elif action in ("take_screenshot", "write_file", "delete_file",
+                    "read_file"):
+        # 路径抽取（引号优先 → 绝对/~ 路径）；写文件再抽"内容是 X"
+        p = _extract_path(text)
+        if p:
+            params["path"] = p
+        if action == "write_file":
+            m = re.search(r"(?:内容|正文|文本)(?:是|为)?[「'\"]?([^，,。\n「'\"]+)",
+                          text)
+            if m:
+                params["content"] = m.group(1).strip()
+    elif action in ("copy_file", "move_file"):
+        # 审计 #24：双路径动作 —— 按话语顺序取前两个"路径形态"作 src/dest
+        # （"把 /a/x.txt 复制到 /b/y"）。只抽到一个就只填 src，dest 缺失
+        # 交组2 如实报"缺少必需参数"，绝不猜目的地。
+        quoted = [q.strip(" ，。、") for q in _QUOTE_RE.findall(text)]
+        paths = quoted if len(quoted) >= 2 else \
+            [p.rstrip("/") for p in _PATH_RE.findall(text)]
+        if not paths:
+            # "把报告复制到备份"：两边都是裸词（无路径形态）→ 按"把X…到Y"抽对，
+            # 由 _finalize_intent 的相对路径归一锚定工作区
+            m = re.search(r"把\s*([^\s，。、」'\"/]+?)(?:复制|拷贝|移动)?"
+                          r"[到至]\s*([^\s，。、」'\"/]+)", text)
+            if m:
+                params["src"], params["dest"] = m.group(1), m.group(2)
+        if paths:
+            params["src"] = paths[0]
+        if len(paths) >= 2:
+            params["dest"] = paths[-1]
+        elif params.get("src"):
+            # "复制到 备份"：目的地是裸词不是路径形态 → 抽"到"后单词，
+            # 由 _finalize_intent 的 dest 归一锚回工作区证据链
+            m = re.search(r"[到往]\s*[「'\"]?([^\s，。、;；]+)", text)
+            if m and m.group(1) != params["src"]:
+                params["dest"] = m.group(1).rstrip("」'\"，。、")
+    elif action in ("organize", "find_duplicates", "backup", "find_large_files",
+                    "cleanup_temp", "find_files", "list_directory"):
+        # 目录级动作：话语里给了显式路径就抽出来（没给则回落工作区）。
+        # 参数名按组4 schema 走：find_files 用 directory，backup 用 src。
+        key = {"find_files": "directory", "backup": "src"}.get(action, "path")
+        cand = ""
+        q = _QUOTE_RE.search(text)
+        if q and action != "find_files":
+            cand = q.group(1).strip(" ，。、")
+        if not cand:
+            m = _PATH_RE.search(text)
+            cand = m.group(1).rstrip("/") if m else ""
+        if cand:
+            params[key] = cand
+    elif action == "run_command":
+        # 只接受显式引号包裹的命令；不猜（避免把整句话当命令执行）
+        q = _QUOTE_RE.search(text)
+        if q:
+            params["cmd"] = q.group(1).strip(" ，。、")
     elif action == "navigate":
         u = re.search(r"[「'\"]?(/[/\w.\-~]+)[「'\"]?", text)
         params["path"] = u.group(1) if u else "~/Documents"
@@ -191,6 +403,9 @@ class HostAgent:
         self._load_config()                   # GUI 保存的供应商配置优先于环境变量
         self.use_llm = bool(self.api_key) if use_llm is None else use_llm
         self.last_engine = "rules"            # 供上层展示本次用了哪条路径
+        # 优化方案 3.1：LLM 原始意图缓存（只缓存 _llm_intent 未归一产出；
+        # _finalize_intent 归一尾段每轮真跑，红线 3。ttl=0 关闭）。
+        self.intent_cache = TTLCache(maxn=128, ttl=300.0)
 
     # ---------------------------------------------------------- --
     # 供应商配置（GUI「LLM 设置」页签读写；明文存放于 system_out/llm_config.json）
@@ -255,18 +470,32 @@ class HostAgent:
     # ---------------------------------------------------------- --
     def understand_intent(self, user_input: str, default_target: str = ".",
                           memory: list | None = None) -> dict:
-        """意图理解入口。memory：RAG 召回的相似历史轨迹（few-shot 注入）。"""
+        """意图理解入口。memory：RAG 召回的相似历史轨迹（few-shot 注入）。
+
+        LLM 路径带 TTL 缓存（优化方案 3.1）：命中只跳过 _llm_intent，
+        _finalize_intent 归一尾段照常执行；last_engine 如实标 "(cache)"。"""
         user_input = (user_input or "").strip()
         intent = None
+        ckey = ""
         if self.use_llm:
+            ckey = cache_key(user_input, default_target, self.model, memory)
+            cached = self.intent_cache.get(ckey)
+            if cached is not None:
+                intent = copy.deepcopy(cached)
+                self.last_engine = f"llm:{self.model}(cache)"
+        if intent is None and self.use_llm:
             try:
-                intent = self._llm_intent(user_input, memory=memory)
+                intent = self._llm_intent(user_input, memory=memory,
+                                  default_target=default_target)
                 self.last_engine = f"llm:{self.model}"
+                self.intent_cache.put(ckey, copy.deepcopy(intent))
             except Exception:
                 time.sleep(2)
                 try:                           # 瞬时限流/抖动重试一次
-                    intent = self._llm_intent(user_input, memory=memory)
+                    intent = self._llm_intent(user_input, memory=memory,
+                                  default_target=default_target)
                     self.last_engine = f"llm:{self.model}"
+                    self.intent_cache.put(ckey, copy.deepcopy(intent))
                 except Exception:
                     intent = None              # 仍失败 → 降级规则
         if intent is None:
@@ -286,20 +515,29 @@ class HostAgent:
         # 宿主环境解析：文件类意图的目标称呼（「demo_task」等）映射为真实目录
         if intent.get("intent") == "文件操作" or intent.get("action") in self._FILE_ACTIONS:
             raw = intent.get("target") or ""
-            resolved = self._resolve_target(raw, default_target)
-            if raw and resolved != raw:
-                intent.setdefault("unresolved", []).append(
-                    f"目标 {raw!r} 未在工作环境找到，已落到默认工作目录")
+            notes: list = []
+            resolved = self._resolve_target(
+                raw, default_target,
+                self._target_mode(intent.get("action") or ""), notes)
+            # 提示文本由 _resolve_target 现场生成（定位到/回落/原样保留），
+            # 不再在外面统一写成"未找到"
+            if raw and resolved != raw and notes:
+                intent.setdefault("unresolved", []).extend(notes)
             intent["target"] = resolved
         # send_email 的 dry_run 确定性归一（不依赖 LLM 随机性）：
         # 出现发邮件动作即视为真实发送（安全由 ADMIN 提权确认流把关）；
-        # 仅当话语含起草/预览类词汇时才降为干跑
-        draft_only = bool(re.search(r"草稿|只预览|先别发|不要发送|别真发", user_input))
+        # 话语含起草/预览类词汇时降为干跑。
+        # 修复逻辑审计 #21：旧版**无条件**用 draft_only 覆盖（False 会把 LLM
+        # 保守给出的 dry_run=True 强制翻成真实外发 —— 单向危险方向）；且
+        # main.py --text / AIShell 路径没有 GUI 确认闸门，真实外发不可逆。
+        # 现在取"保守单向"：规则判草稿 **或** LLM 明确判草稿 → 干跑；
+        # 只有两路都表态"真发"才真发。
+        draft_only = bool(_DRAFT_RE.search(user_input))
         for g in intent.get("goals", []):
             if g.get("action") == "send_email":
-                g.setdefault("params", {})["dry_run"] = draft_only
+                _norm_dry_run(_ensure_params(g), draft_only)
         if intent.get("action") == "send_email":
-            intent.setdefault("params", {})["dry_run"] = draft_only
+            _norm_dry_run(_ensure_params(intent), draft_only)
 
         # send_email 多目标合并：LLM 偶尔把"多文件发给同一人"拆成多条——
         # 合并为一条，附件收进列表（send_email 已支持数组多附件）
@@ -307,7 +545,7 @@ class HostAgent:
                       if g.get("action") == "send_email"]
         if len(send_goals) > 1:
             first = send_goals[0]
-            fp = first.setdefault("params", {})
+            fp = _ensure_params(first)
             for g in send_goals[1:]:
                 for k, v in (g.get("params") or {}).items():
                     if v in ("", None):
@@ -332,7 +570,7 @@ class HostAgent:
         # - 不存在的绝对路径（LLM 编造的 /data/out/…）→ 工作区 + 文件名
         # - 已存在的绝对路径 → 保留（用户明确指定的真实位置）
         # - 目录级动作工作区外且话语无迹可循 → 工作区（证据防线）
-        for g in intent.get("goals", []):
+        for g in self._norm_nodes(intent):
             action = g.get("action")
             if action not in self._FILE_ACTIONS and action != "take_screenshot":
                 continue
@@ -341,7 +579,7 @@ class HostAgent:
                 v = (g.get("params") or {}).get(k)
                 if v in (None, ""):
                     if is_dir_scope:
-                        g.setdefault("params", {})[k] = default_target
+                        _ensure_params(g)[k] = default_target
                     continue                              # 缺路径 → 工作区
                 v = str(v).strip()
                 if re.fullmatch(r"\$\{?\w+\}?", v):
@@ -351,9 +589,16 @@ class HostAgent:
                     g["params"][k] = default_target
                     continue
                 v = os.path.expanduser(v)
-                if os.path.isabs(v) and os.path.exists(v):
+                if _is_abs_any(v) and os.path.exists(v):
                     r = v                                 # 真实位置 → 保留
-                elif os.path.isabs(v):
+                elif _is_abs_any(v) and action in self._TARGET_STRICT_ACTIONS:
+                    # 红线 10 在参数面的同款缺口：这条"幻觉锚定"是给 LLM
+                    # 编路径准备的兜底，但**规则路径里用户亲口说的严格动作
+                    # （删除/复制/移动/读取/搜索）绝对路径**也被它劫持过 ——
+                    # "删除 /no/such/x.txt"变"删除 工作区/x.txt"。严格动作的
+                    # 不存在绝对路径必须原样保留，交工具如实报"不存在"。
+                    r = v
+                elif _is_abs_any(v):
                     # 不存在的绝对路径：父目录真实 → 合法的计划输出文件，保留；
                     # 父目录也不存在（幻觉前缀如 /data/out）→ 工作区 + 文件名
                     parent = os.path.dirname(v.rstrip("/\\"))
@@ -366,8 +611,15 @@ class HostAgent:
                 if is_dir_scope and r != default_target \
                         and not os.path.isdir(r):
                     r = default_target
+                # 修复逻辑审计 #3：文件系统根目录直接回落工作区。'/' 的
+                # basename 是空串、`"" in user_input` 恒真，证据防线对根目录
+                # 失效（LLM 输出 path:"/" 时 organize 会按类型搬运整个根目录）。
+                if is_dir_scope and r != default_target and _is_fs_root(r):
+                    intent.setdefault("unresolved", []).append(
+                        f"目录级动作 {action} 的目标是文件系统根目录，已回落工作区")
+                    r = default_target
                 if (is_dir_scope and r != default_target
-                        and not r.startswith(default_target.rstrip("/") + "/")
+                        and not _is_under(r, default_target)
                         and os.path.basename(r.rstrip("/\\"))
                         not in (user_input or "")):
                     r = default_target                    # 证据防线
@@ -375,6 +627,12 @@ class HostAgent:
             d = (g.get("params") or {}).get("dest")
             if d and re.fullmatch(r"\$\{?\w+\}?", str(d).strip()):
                 g["params"].pop("dest", None)     # 变量占位 → 组2 重派生
+                d = None
+            if d and str(d).strip() in (user_input or ""):
+                # 话语证据直通：dest 是用户亲口给的路径（规则抽取的
+                # copy/move dest 恒属此类）—— 与 src 同口径只做 expanduser，
+                # 不做存在性驳回（新目录本就尚不存在）。存在性交给工具如实报错。
+                g["params"]["dest"] = os.path.expanduser(str(d).strip())
                 d = None
             if d:
                 src_v = (g.get("params") or {}).get("src") or default_target
@@ -401,7 +659,7 @@ class HostAgent:
         # 附件在执行期由 send_email 自行校验，缺文件时如实报错
         def _planned_files() -> list:
             files = []
-            for g in intent.get("goals", []):
+            for g in self._norm_nodes(intent):
                 gp = g.get("params") or {}
                 if g.get("action") in ("take_screenshot", "write_file") \
                         and gp.get("path"):
@@ -443,24 +701,30 @@ class HostAgent:
         for a in extra:
             if not a or "{{" in a or re.fullmatch(r"\$\{?\w+\}?", a):
                 continue
-            a_abs = os.path.abspath(os.path.expanduser(a))
-            if os.path.isfile(a_abs) \
-                    and os.path.basename(a_abs) not in seen_base:
+            # 修复逻辑审计（轻微·附件 CWD）：裸文件名先按**工作区**解析，
+            # 找不到才回落进程 CWD —— 与"相对路径锚定工作区"同口径
+            # （旧版 os.path.abspath 直接按 CWD，会取到进程目录的旧副本）
+            ap = os.path.expanduser(a)
+            cands = ([os.path.join(default_target, ap)]
+                     if not (os.path.isabs(ap) or _is_abs_any(ap)) else []) + [ap]
+            a_abs = next((os.path.abspath(c) for c in cands
+                          if os.path.isfile(os.path.abspath(c))), "")
+            if a_abs and os.path.basename(a_abs) not in seen_base:
                 wanted.append(a_abs)
                 seen_base.add(os.path.basename(a_abs))
         for g in intent.get("goals", []):
             if g.get("action") == "send_email":
                 if wanted:
-                    g.setdefault("params", {})["attachment"] = \
+                    _ensure_params(g)["attachment"] = \
                         wanted[0] if len(wanted) == 1 else list(wanted)
                 else:
-                    g["params"].pop("attachment", None)   # 占位符全灭 → 不附
+                    _ensure_params(g).pop("attachment", None)  # 占位符全灭 → 不附
         if intent.get("action") == "send_email":
             if wanted:
-                intent.setdefault("params", {})["attachment"] = \
+                _ensure_params(intent)["attachment"] = \
                     wanted[0] if len(wanted) == 1 else list(wanted)
             else:
-                intent["params"].pop("attachment", None)
+                _ensure_params(intent).pop("attachment", None)
 
         intent["user_text"] = user_input
         intent["intent_id"] = f"intent-{uuid.uuid4().hex[:8]}"
@@ -471,12 +735,47 @@ class HostAgent:
     _FILE_ACTIONS = {"organize", "find_duplicates", "backup", "find_large_files",
                      "find_files", "cleanup_temp", "delete_file",
                      "organize_downloads", "find_duplicate_files",
-                     "backup_directory", "write_file", "take_screenshot"}
+                     "backup_directory", "write_file", "take_screenshot",
+                     # 审计 #24：纳入后它们的 path/src/dest 走同一条路径归一
+                     # （相对名锚工作区、幻觉绝对路径按证据防线处理）
+                     "copy_file", "move_file", "read_file", "list_directory"}
     # 作用域为整个目录的动作：'.'/'..' 必须映射到工作区，禁止落到进程 CWD
     _DIR_SCOPE_ACTIONS = {"organize", "find_duplicates", "backup",
                           "find_large_files", "cleanup_temp",
                           "organize_downloads", "find_duplicate_files",
                           "backup_directory"}
+    # target 解析模式（对应 _resolve_target 的 mode）：
+    #   workspace 目录级动作 —— 解析不出就落到工作区（演示语义）
+    #   anchor    产出型动作   —— 相对名锚定工作区，绝不落进程 CWD
+    #   strict    破坏/搜索动作 —— 解析不出就原样保留，交工具如实报"不存在"
+    _TARGET_ANCHOR_ACTIONS = {"write_file", "take_screenshot"}
+    # 审计 #24（红线 10）：读取/复制/移动的 target 指向**已存在的文件**，
+    # 解析不出就回落工作区等于"对整个工作区做只读/搬运"——语义全错，
+    # 必须 strict 原样保留、交工具如实报"不存在"
+    _TARGET_STRICT_ACTIONS = {"delete_file", "find_files",
+                              "read_file", "copy_file", "move_file"}
+
+    @classmethod
+    def _target_mode(cls, action: str) -> str:
+        if action in cls._DIR_SCOPE_ACTIONS:
+            return "workspace"
+        if action in cls._TARGET_ANCHOR_ACTIONS:
+            return "anchor"
+        if action in cls._TARGET_STRICT_ACTIONS:
+            return "strict"
+        return "workspace"
+
+    @staticmethod
+    def _norm_nodes(intent: dict) -> list[dict]:
+        """路径归一的处理单元：顶层 intent 自身 + 全部 goals。
+
+        规则路径把参数挂在 intent.params（goals 无 params），LLM 路径挂在
+        goal.params —— 两边都必须归一，否则相对路径会原样进工具、被按进程
+        CWD 解析（曾把备份 zip 写进项目根）。
+        """
+        nodes = [intent]
+        nodes += [g for g in (intent.get("goals") or []) if isinstance(g, dict)]
+        return nodes
 
     def detect_operation(self, user_input: str) -> dict | None:
         """对话路由检测：规则引擎识别系统操作意图（确定性、零 token）。
@@ -547,29 +846,68 @@ class HostAgent:
           make_archive 按 CWD 落盘，demo_task_backup.zip 曾被写进项目根。
         """
         d = os.path.expanduser(str(dest))
-        if os.path.isabs(d):
+        if _is_abs_any(d):
             return d if os.path.isdir(os.path.dirname(d.rstrip("/\\"))) else None
         s = os.path.expanduser(str(src))
-        base = os.path.dirname(s) if os.path.isabs(s) \
+        base = os.path.dirname(s) if _is_abs_any(s) \
             else os.path.dirname(default_target)
         return os.path.join(base, d)
 
     @staticmethod
-    def _resolve_target(raw: str, default_target: str) -> str:
-        """把用户口中的目标称呼解析为工作环境里的真实目录。"""
+    def _resolve_target(raw: str, default_target: str,
+                        mode: str = "workspace",
+                        notes: list | None = None) -> str:
+        """把用户口中的目标称呼解析为工作环境里的真实路径。
+
+        mode 决定"解析不出来"时的行为（见 _TARGET_MODE 注释）：
+          - workspace：回落 default_target
+          - anchor   ：相对名锚定 default_target（产出型动作，不许落 CWD）
+          - strict   ：原样保留，让工具如实报"不存在"
+
+        早期实现对任何动作"找不到就回落工作区"，于是"删除一个不存在的
+        路径"变成了"删除整个工作区"。
+        notes：可选的提示收集器 —— 只有这里知道究竟"定位到了/回落了/原样保留"，
+             调用方据此给出**如实**的提示（旧实现在外面统一写成"未找到"，
+             连成功定位到工作区子目录也报"未找到"）。
+        """
+        def _note(msg: str) -> None:
+            if notes is not None:
+                notes.append(msg)
+
         if not raw:
             return default_target
         expanded = os.path.expanduser(raw)
-        if os.path.isabs(expanded):
-            return expanded if os.path.exists(expanded) else default_target
-        if os.path.exists(expanded):
+        if _is_abs_any(expanded):
+            if os.path.exists(expanded):
+                _note(f"目标 {raw!r} 位于 {expanded}")
+                return expanded
+            # 不存在：目录级动作回落工作区；产出/破坏动作保留真实路径
+            if mode == "workspace":
+                _note(f"目标 {raw!r} 不存在，已落到默认工作目录 {default_target}")
+                return default_target
+            _note(f"目标 {raw!r} 不存在，按原样交给工具（由工具如实报错）")
             return expanded
-        for base in (os.path.dirname(default_target), os.getcwd(),
-                     os.path.expanduser("~")):
+        if os.path.exists(expanded):
+            _note(f"目标 {raw!r} 位于 {expanded}")
+            return expanded
+        # 搜索顺序：工作区自身 → 工作区父目录 → 进程 CWD → 主目录。
+        # 把 default_target 放进搜索基：用户口中的相对名很可能就是工作区里的
+        # 子目录（"整理 demo_task"），此前不搜工作区会白白回落成"整目录"。
+        for base in (default_target, os.path.dirname(default_target),
+                     os.getcwd(), os.path.expanduser("~")):
             cand = os.path.join(base, raw)
             if os.path.exists(cand):
+                _note(f"目标 {raw!r} 已定位到 {cand}")
                 return cand
-        return default_target            # 找不到 → 宿主默认工作目录
+        if mode == "workspace":
+            _note(f"目标 {raw!r} 未找到，已落到默认工作目录 {default_target}")
+            return default_target            # 找不到 → 宿主默认工作目录
+        if mode == "anchor":
+            anchored = os.path.join(default_target, raw)
+            _note(f"目标 {raw!r} 未找到，已锚定到工作区 {anchored}")
+            return anchored                  # 相对名锚定工作区
+        _note(f"目标 {raw!r} 未找到，按原样交给工具（由工具如实报错）")
+        return raw                           # strict：保留原样，如实报错
 
     # ---------------------------------------------------------- --
     # LLM 路径（urllib 直连 OpenAI 兼容接口，零第三方依赖）
@@ -579,12 +917,14 @@ class HostAgent:
         '格式：{"intent":"类别","target":"","confidence":0.9,"goals":'
         '[{"action":"..","target":"..","params":{..}}]}，多动作按执行顺序排列。\n'
         "可用 action：organize/find_duplicates/backup/find_large_files/find_files/"
-        "cleanup_temp/delete_file/disk_usage/system_check/open_url/open_app/"
+        "cleanup_temp/delete_file/copy_file/move_file/read_file/list_directory/"
+        "disk_usage/system_check/open_url/open_app/"
         "send_email/weather/search/translate/write_file/run_command/"
         "navigate/create_folder/switch_window/take_screenshot/click_element/"
         "web_search/web_open/web_click/web_state/web_extract/llm_answer/"
         "web_close_browser\n"
         "工具参数：write_file(path,content) run_command(cmd[,timeout]) open_url(url) "
+        "copy_file(src,dest) move_file(src,dest) read_file(path) list_directory([path]) "
         "open_app(app) send_email(to,subject,body,attachment[文件路径],"
         "dry_run[用户明确要发=false]) take_screenshot([path]) mcp_weather(city[,days]) "
         "mcp_search(query) mcp_translate(text,to_lang) web_search(query[,engine]) "
@@ -594,6 +934,9 @@ class HostAgent:
         "打开/跳转到某个文件路径或目录=navigate(path)（先打开文件管理器再跳转，不要用 run_command）；"
         "导航=navigate(path)；创建文件夹=create_folder(name)；切换窗口=switch_window(app)；"
         "截屏=take_screenshot(path，随后的 send_email/write_file 引用同一路径)\n"
+        "文件操作：把A复制到B=copy_file(src:A,dest:B)；把A移动到B=move_file(src,dest)；"
+        "查看/读取文件内容=read_file(path)；看目录里有哪些文件=list_directory(path)；"
+        "src 必须来自用户话语或工作区真实文件，不要编路径\n"
         "网页与搜索：看搜索结果页/后续要点击=web_search(query)；"
         "要数据(写文件/回答)=mcp_search(query)；"
         "点击第N条搜索结果=web_search(query)后接 web_click(nth=N)；"
@@ -611,9 +954,14 @@ class HostAgent:
         "intent 类别：文件操作/应用控制/系统设置/信息查询，取第一个动作所属\n"
     )
 
-    def _llm_intent(self, text: str, memory: list | None = None) -> dict | None:
-        if not text:
-            return None
+    def _llm_system_prompt(self, memory: list | None = None,
+                           default_target: str = "") -> str:
+        """意图理解的 system prompt：动作表 + **真实落点/平台**（抑制路径幻觉）。
+
+        只给动作表是不够的：模型不知道本机文件系统的真实样子，会照训练语料编
+        路径（实测「发送aaa给3398...@qq.com」被编出 `/mnt/...` 这种不存在的位置 ——
+        附件必然找不到，还会撞上受保护路径拦截）。
+        """
         system = self._SYSTEM_PROMPT
         if memory:
             # RAG 记忆注入：相似历史轨迹作 few-shot 参考（动作选择借鉴，
@@ -624,6 +972,20 @@ class HostAgent:
                 for m in memory[:2])
             system += ("\n相似历史任务的处理记录（供参考动作选择，不要照抄参数）:\n"
                        + refs)
+        ctx = []
+        if default_target:
+            ctx.append(f"当前工作区（用户没明确给路径时的默认落点）：{default_target}")
+        ctx.append("运行平台：" + ("Windows" if os.name == "nt" else "Linux/POSIX"))
+        ctx.append("路径纪律：参数里的路径必须是**用户话语里出现过**的，或位于当前工作区内；"
+                   "不要编造 /mnt、/home/user 之类没出现过的路径；"
+                   "用户没给路径就不要塞路径参数（附件/路径留空，由后续流程自行校验）。")
+        return system + "\n" + "\n".join(ctx)
+
+    def _llm_intent(self, text: str, memory: list | None = None,
+                    default_target: str = "") -> dict | None:
+        if not text:
+            return None
+        system = self._llm_system_prompt(memory, default_target)
         # OpenAI 兼容 chat/completions 请求体（urllib 直连，零 SDK 依赖）
         body = json.dumps({
             "model": self.model,
@@ -676,6 +1038,19 @@ class HostAgent:
                     "goals": []}
         primary = goals[0]
         params = _extract_params(primary["action"], text)
+        primary.pop("_pos", None)
+        # 每个 goal 各自抽参：多目标指令里非首个目标同样需要自己的参数
+        # （早期只抽主目标的参数，其余目标全靠兜底填充，易被填成无关值）。
+        # 修复逻辑审计 #2：非主目标按**整句**抽参时，_extract_path 取全句第一个
+        # 引号/路径 —— 多目标互相污染（"整理「报告.docx」再删除「临时.txt」"
+        # 删成了报告.docx）。现在只在命中动作所属的分句内抽参。
+        for g in goals:
+            if g is primary:
+                continue
+            seg = _clause_for(text, g.pop("_pos", 0) or 0)
+            gp = _extract_params(g["action"], seg)
+            if gp:
+                g["params"] = gp
         target = (quote.group(1) if quote
                   else params.get("name") or params.get("path") or params.get("city")
                   or params.get("url") or "")

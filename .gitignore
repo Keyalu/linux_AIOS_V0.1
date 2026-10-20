@@ -22,6 +22,8 @@ out/
 *.tar
 *.gz
 *.log
+# 软删除回收站（delete_file 默认落点）：可人工找回，不入库
+.aios_trash/
 
 # ---------- Python ----------
 __pycache__/
@@ -37,7 +39,11 @@ build/
 dist/
 
 # ---------- 测试临时目录 ----------
-tests/.tmp_out_*/
+tests/.tmp_*/
+
+# ---------- Agent 工具本地状态（会话记忆、内部草稿）----------
+.workbuddy/
+.workbuddy-ai/
 
 # ---------- 编辑器 / 系统 ----------
 .idea/

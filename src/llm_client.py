@@ -48,9 +48,12 @@ def chat_stream(messages: list, timeout: int = 120):
     cfg = load_config()
     if not cfg:
         raise RuntimeError("未配置 LLM Key（LLM 设置页检查）")
-    for m in messages[-16:]:
-        m["content"] = str(m.get("content", ""))[:4000]
-    body = json.dumps({"model": cfg["model"], "messages": messages[-16:],
+    # 修复逻辑审计（轻微）：截断只作用于**发给服务端的副本** —— 旧版就地改
+    # m["content"]，把调用方自己维护的会话历史悄悄截成 4000 字符
+    send_msgs = [{"role": m.get("role", "user"),
+                  "content": str(m.get("content", ""))[:4000]}
+                 for m in messages[-16:]]
+    body = json.dumps({"model": cfg["model"], "messages": send_msgs,
                        "temperature": 0.3, "stream": True}).encode()
     req = urllib.request.Request(
         f"{cfg['base_url']}/chat/completions", data=body,

@@ -25,12 +25,21 @@ class ToolStats(IToolStats):
 
     def __init__(self, log_path: str | None = None) -> None:
         self._log_path = log_path
+        # 修复逻辑审计 #12：账本 params 全量落盘会把 send_email.password、
+        # write_file.content 等明文写进 stats.json 并经 /api/stats 回前端。
+        # 组4 不 import 组5 —— 由编排层把组5 的 mask_record 作为**函数对象**
+        # 注入（红线 13 同款数据注入），入库前统一脱敏。
+        self._redactor = None
         # 双结构：_records 逐笔流水（GUI 逐笔页），_counters 按工具聚合（报表）
         self._records: list[dict[str, Any]] = []
         self._counters: dict[str, dict[str, int]] = {}
         # 传入 log_path 即从磁盘续账（跨运行累积账本，持久性）
         if log_path:
             self._load()
+
+    def set_redactor(self, fn) -> None:
+        """注入入库脱敏回调（如组5 SecuritySandbox.mask_record）。"""
+        self._redactor = fn if callable(fn) else None
 
     def record(self, record: CallRecord) -> None:
         """记录一次工具调用。"""
@@ -44,6 +53,12 @@ class ToolStats(IToolStats):
         }
         if record.error:
             entry["error"] = record.error
+        if self._redactor is not None:
+            # 脱敏失败不拖垮记账：宁可少一层遮蔽，账本必须落得下
+            try:
+                entry = self._redactor(entry)
+            except Exception:
+                pass
 
         self._records.append(entry)
 
@@ -55,10 +70,11 @@ class ToolStats(IToolStats):
         if record.success:
             c["success"] += 1
         else:
-
-        # 每笔即落盘：进程崩溃最多丢当前一笔（原子写）
             c["fail"] += 1
 
+        # 每笔即落盘：进程崩溃最多丢当前一笔（原子写）。
+        # 注：这是"逐笔持久性"换来的代价（每笔全量重写）；高压场景请改用
+        #     src/stats_buffered.BufferedToolStats（增量批量 + 环形上限 + 锁）。
         if self._log_path:
             self._save()
 
@@ -107,10 +123,14 @@ class ToolStats(IToolStats):
             "updated": datetime.now().isoformat(),
         }
         # 原子写：先写临时文件再 os.replace 原子替换，写一半崩溃也不损坏账本
+        # 修复逻辑审计 #18：显式 encoding="utf-8" —— tempfile 默认走 locale
+        # 编码（Windows=GBK），与读取侧/其他写入口径不一致，中文参数一多
+        # 账本就会混合编码损坏
         dir_name = os.path.dirname(self._log_path) or "."
         try:
             with tempfile.NamedTemporaryFile(
-                "w", dir=dir_name, suffix=".tmp", delete=False
+                "w", dir=dir_name, suffix=".tmp", delete=False,
+                encoding="utf-8"
             ) as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 tmp_path = f.name
@@ -120,11 +140,14 @@ class ToolStats(IToolStats):
 
     def _load(self) -> None:
         try:
-            with open(self._log_path) as f:
+            # 修复逻辑审计 #18：读取同样钉死 UTF-8（此前 locale=GBK 环境直接
+            # UnicodeDecodeError 穿透，build() 被打死）；坏账本回落从零开始
+            with open(self._log_path, encoding="utf-8") as f:
                 data = json.load(f)
                 self._records = data.get("records", [])
                 self._counters = data.get("counters", {})
         # 首次运行/账本损坏 → 从零开始，不让历史问题拖垮当前编排
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, json.JSONDecodeError,
+                UnicodeDecodeError):
             self._records = []
             self._counters = {}
